@@ -7,8 +7,6 @@
 
 > AI-powered lip reading tool that transcribes speech from silent video using state-of-the-art visual speech recognition models.
 
-![Screenshot](screenshot.png)
-
 ## Quick Start
 
 ```bash
