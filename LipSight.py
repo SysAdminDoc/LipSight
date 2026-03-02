@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-LipSight v1.0 — AI Lip Reading Tool
+LipSight v1.1 — AI Lip Reading Tool
 Powered by Auto-AVSR (state-of-the-art visual speech recognition)
-Uses Replicate API for cloud inference with local face/mouth detection
+Supports: Local PyTorch inference (FREE), HuggingFace Spaces (FREE), Replicate API, Custom Endpoints
 """
 
-import sys, os, subprocess, json, time, tempfile, threading, math, struct, re
+import sys, os, subprocess, json, time, tempfile, threading, math, hashlib, random, shutil
 from pathlib import Path
 from datetime import timedelta
 
 # ── Auto-Bootstrap ──────────────────────────────────────────────────────────
 def _bootstrap():
+    """Auto-install dependencies and configure prerequisites."""
     if sys.version_info < (3, 8):
         print("Python 3.8+ required"); sys.exit(1)
-    required = ['PyQt6', 'opencv-python', 'mediapipe', 'requests', 'numpy']
+
+    required = ['PyQt6', 'opencv-python', 'requests', 'numpy']
     for pkg in required:
         mod = pkg.split('[')[0].replace('-', '_').lower()
         if mod == 'opencv_python': mod = 'cv2'
@@ -29,22 +31,39 @@ def _bootstrap():
                 except subprocess.CalledProcessError:
                     continue
 
+    for pkg in ['mediapipe']:
+        try:
+            __import__(pkg)
+        except ImportError:
+            for flags in [[], ['--user'], ['--break-system-packages']]:
+                try:
+                    subprocess.check_call(
+                        [sys.executable, '-m', 'pip', 'install', pkg, '-q'] + flags,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    break
+                except subprocess.CalledProcessError:
+                    continue
+
 _bootstrap()
 
 import cv2
 import numpy as np
-import mediapipe as mp
+try:
+    import mediapipe as _mp
+    _HAS_MEDIAPIPE = True
+except Exception:
+    _HAS_MEDIAPIPE = False
+    _mp = None
 import requests
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
 
-# ── Version ─────────────────────────────────────────────────────────────────
 APP_NAME = "LipSight"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
-# ── Catppuccin Mocha Theme ──────────────────────────────────────────────────
-COLORS = {
+# ── Catppuccin Mocha ────────────────────────────────────────────────────────
+C = {
     'base': '#1e1e2e', 'mantle': '#181825', 'crust': '#11111b',
     'surface0': '#313244', 'surface1': '#45475a', 'surface2': '#585b70',
     'overlay0': '#6c7086', 'overlay1': '#7f849c', 'text': '#cdd6f4',
@@ -56,102 +75,86 @@ COLORS = {
 }
 
 DARK_STYLE = f"""
-QMainWindow, QWidget {{ background-color: {COLORS['base']}; color: {COLORS['text']}; }}
-QMenuBar {{ background-color: {COLORS['mantle']}; color: {COLORS['text']}; }}
-QMenuBar::item:selected {{ background-color: {COLORS['surface0']}; }}
-QMenu {{ background-color: {COLORS['base']}; border: 1px solid {COLORS['surface1']}; }}
-QMenu::item:selected {{ background-color: {COLORS['surface0']}; }}
+QMainWindow, QWidget {{ background-color: {C['base']}; color: {C['text']}; }}
+QMenuBar {{ background-color: {C['mantle']}; color: {C['text']}; }}
 QPushButton {{
-    background-color: {COLORS['blue']}; color: {COLORS['base']}; border: none;
+    background-color: {C['blue']}; color: {C['base']}; border: none;
     padding: 8px 18px; border-radius: 6px; font-weight: bold; font-size: 13px;
 }}
-QPushButton:hover {{ background-color: {COLORS['sky']}; }}
-QPushButton:pressed {{ background-color: {COLORS['lavender']}; }}
-QPushButton:disabled {{ background-color: {COLORS['surface1']}; color: {COLORS['overlay0']}; }}
-QPushButton#dangerBtn {{ background-color: {COLORS['red']}; }}
-QPushButton#dangerBtn:hover {{ background-color: {COLORS['flamingo']}; }}
-QPushButton#secondaryBtn {{ background-color: {COLORS['surface0']}; color: {COLORS['text']}; }}
-QPushButton#secondaryBtn:hover {{ background-color: {COLORS['surface1']}; }}
-QPushButton#accentBtn {{ background-color: {COLORS['mauve']}; }}
-QPushButton#accentBtn:hover {{ background-color: {COLORS['lavender']}; }}
+QPushButton:hover {{ background-color: {C['sky']}; }}
+QPushButton:pressed {{ background-color: {C['lavender']}; }}
+QPushButton:disabled {{ background-color: {C['surface1']}; color: {C['overlay0']}; }}
+QPushButton#dangerBtn {{ background-color: {C['red']}; }}
+QPushButton#dangerBtn:hover {{ background-color: {C['flamingo']}; }}
+QPushButton#secondaryBtn {{ background-color: {C['surface0']}; color: {C['text']}; }}
+QPushButton#secondaryBtn:hover {{ background-color: {C['surface1']}; }}
+QPushButton#accentBtn {{ background-color: {C['mauve']}; }}
+QPushButton#accentBtn:hover {{ background-color: {C['lavender']}; }}
+QPushButton#greenBtn {{ background-color: {C['green']}; color: {C['base']}; }}
+QPushButton#greenBtn:hover {{ background-color: {C['teal']}; }}
 QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox {{
-    background-color: {COLORS['surface0']}; color: {COLORS['text']};
-    border: 1px solid {COLORS['surface1']}; border-radius: 6px; padding: 8px;
-    selection-background-color: {COLORS['blue']}; selection-color: {COLORS['base']};
-    font-size: 13px;
+    background-color: {C['surface0']}; color: {C['text']};
+    border: 1px solid {C['surface1']}; border-radius: 6px; padding: 8px;
+    selection-background-color: {C['blue']}; selection-color: {C['base']}; font-size: 13px;
 }}
-QLineEdit:focus, QTextEdit:focus {{ border: 1px solid {COLORS['blue']}; }}
+QLineEdit:focus, QTextEdit:focus {{ border: 1px solid {C['blue']}; }}
 QComboBox {{
-    background-color: {COLORS['surface0']}; color: {COLORS['text']};
-    border: 1px solid {COLORS['surface1']}; border-radius: 6px; padding: 8px;
-    font-size: 13px;
+    background-color: {C['surface0']}; color: {C['text']};
+    border: 1px solid {C['surface1']}; border-radius: 6px; padding: 8px; font-size: 13px;
 }}
 QComboBox::drop-down {{ border: none; width: 24px; }}
 QComboBox QAbstractItemView {{
-    background-color: {COLORS['base']}; color: {COLORS['text']};
-    border: 1px solid {COLORS['surface1']}; selection-background-color: {COLORS['blue']};
+    background-color: {C['base']}; color: {C['text']};
+    border: 1px solid {C['surface1']}; selection-background-color: {C['blue']};
 }}
-QLabel {{ color: {COLORS['text']}; font-size: 13px; }}
-QLabel#header {{ font-size: 22px; font-weight: bold; color: {COLORS['blue']}; }}
-QLabel#subheader {{ font-size: 14px; color: {COLORS['subtext0']}; }}
-QLabel#sectionTitle {{ font-size: 15px; font-weight: bold; color: {COLORS['lavender']}; }}
-QLabel#dimLabel {{ color: {COLORS['overlay0']}; font-size: 12px; }}
-QLabel#statValue {{ font-size: 28px; font-weight: bold; color: {COLORS['blue']}; }}
-QLabel#statLabel {{ font-size: 11px; color: {COLORS['overlay1']}; text-transform: uppercase; }}
+QLabel {{ color: {C['text']}; font-size: 13px; }}
+QLabel#dimLabel {{ color: {C['overlay0']}; font-size: 12px; }}
 QGroupBox {{
-    border: 1px solid {COLORS['surface1']}; border-radius: 10px;
-    margin-top: 1.2em; padding: 16px 12px 12px 12px; color: {COLORS['text']};
+    border: 1px solid {C['surface1']}; border-radius: 10px;
+    margin-top: 1.2em; padding: 16px 12px 12px 12px; color: {C['text']};
     font-weight: bold; font-size: 13px;
 }}
-QGroupBox::title {{ subcontrol-origin: margin; left: 14px; padding: 0 8px; color: {COLORS['lavender']}; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 14px; padding: 0 8px; color: {C['lavender']}; }}
 QProgressBar {{
-    background-color: {COLORS['surface0']}; border: none; border-radius: 5px;
-    text-align: center; color: {COLORS['text']}; font-size: 12px; min-height: 10px;
+    background-color: {C['surface0']}; border: none; border-radius: 5px;
+    text-align: center; color: {C['text']}; font-size: 12px; min-height: 10px;
 }}
-QProgressBar::chunk {{ background-color: {COLORS['blue']}; border-radius: 5px; }}
-QSlider::groove:horizontal {{
-    height: 6px; background: {COLORS['surface0']}; border-radius: 3px;
-}}
+QProgressBar::chunk {{ background-color: {C['blue']}; border-radius: 5px; }}
+QSlider::groove:horizontal {{ height: 6px; background: {C['surface0']}; border-radius: 3px; }}
 QSlider::handle:horizontal {{
-    background: {COLORS['blue']}; width: 16px; height: 16px;
-    margin: -5px 0; border-radius: 8px;
+    background: {C['blue']}; width: 16px; height: 16px; margin: -5px 0; border-radius: 8px;
 }}
-QSlider::handle:horizontal:hover {{ background: {COLORS['sky']}; }}
-QSlider::sub-page:horizontal {{ background: {COLORS['blue']}; border-radius: 3px; }}
+QSlider::sub-page:horizontal {{ background: {C['blue']}; border-radius: 3px; }}
 QScrollBar:vertical {{
-    background: {COLORS['mantle']}; width: 8px; border: none; border-radius: 4px;
+    background: {C['mantle']}; width: 8px; border: none; border-radius: 4px;
 }}
-QScrollBar::handle:vertical {{
-    background: {COLORS['surface1']}; border-radius: 4px; min-height: 30px;
-}}
-QScrollBar::handle:vertical:hover {{ background: {COLORS['surface2']}; }}
+QScrollBar::handle:vertical {{ background: {C['surface1']}; border-radius: 4px; min-height: 30px; }}
+QScrollBar::handle:vertical:hover {{ background: {C['surface2']}; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-QTabWidget::pane {{ border: 1px solid {COLORS['surface1']}; background: {COLORS['base']}; border-radius: 8px; }}
+QTabWidget::pane {{ border: 1px solid {C['surface1']}; background: {C['base']}; border-radius: 8px; }}
 QTabBar::tab {{
-    background: {COLORS['mantle']}; color: {COLORS['overlay0']}; padding: 10px 20px;
+    background: {C['mantle']}; color: {C['overlay0']}; padding: 10px 20px;
     border: none; font-size: 13px; font-weight: bold;
 }}
-QTabBar::tab:selected {{ color: {COLORS['text']}; border-bottom: 2px solid {COLORS['blue']}; }}
-QTabBar::tab:hover {{ color: {COLORS['subtext1']}; }}
+QTabBar::tab:selected {{ color: {C['text']}; border-bottom: 2px solid {C['blue']}; }}
+QTabBar::tab:hover {{ color: {C['subtext1']}; }}
 QTableWidget {{
-    background-color: {COLORS['base']}; alternate-background-color: {COLORS['mantle']};
-    color: {COLORS['text']}; border: 1px solid {COLORS['surface1']};
-    gridline-color: {COLORS['surface0']}; font-size: 13px; border-radius: 6px;
+    background-color: {C['base']}; alternate-background-color: {C['mantle']};
+    color: {C['text']}; border: 1px solid {C['surface1']};
+    gridline-color: {C['surface0']}; font-size: 13px; border-radius: 6px;
 }}
-QTableWidget::item:selected {{ background-color: {COLORS['blue']}; color: {COLORS['base']}; }}
+QTableWidget::item:selected {{ background-color: {C['blue']}; color: {C['base']}; }}
 QHeaderView::section {{
-    background-color: {COLORS['mantle']}; color: {COLORS['subtext0']};
-    border: none; border-bottom: 1px solid {COLORS['surface1']}; padding: 8px;
+    background-color: {C['mantle']}; color: {C['subtext0']};
+    border: none; border-bottom: 1px solid {C['surface1']}; padding: 8px;
     font-weight: bold; font-size: 12px;
 }}
-QStatusBar {{ background-color: {COLORS['mantle']}; color: {COLORS['overlay0']}; font-size: 12px; }}
+QStatusBar {{ background-color: {C['mantle']}; color: {C['overlay0']}; font-size: 12px; }}
 QToolTip {{
-    background-color: {COLORS['surface0']}; color: {COLORS['text']};
-    border: 1px solid {COLORS['surface1']}; padding: 6px; border-radius: 6px;
+    background-color: {C['surface0']}; color: {C['text']};
+    border: 1px solid {C['surface1']}; padding: 6px; border-radius: 6px;
 }}
-QSplitter::handle {{ background: {COLORS['surface1']}; }}
-QSplitter::handle:horizontal {{ width: 2px; }}
-QSplitter::handle:vertical {{ height: 2px; }}
+QCheckBox {{ color: {C['text']}; spacing: 8px; }}
 """
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -162,1170 +165,858 @@ def get_config_dir():
     return path
 
 def load_config():
-    cfg_file = os.path.join(get_config_dir(), 'config.json')
     try:
-        with open(cfg_file) as f: return json.load(f)
+        with open(os.path.join(get_config_dir(), 'config.json')) as f: return json.load(f)
     except: return {}
 
 def save_config(cfg):
-    cfg_file = os.path.join(get_config_dir(), 'config.json')
-    with open(cfg_file, 'w') as f: json.dump(cfg, f, indent=2)
+    with open(os.path.join(get_config_dir(), 'config.json'), 'w') as f: json.dump(cfg, f, indent=2)
 
-# ── Face/Mouth Detection ───────────────────────────────────────────────────
+
+# ── Face Detection ──────────────────────────────────────────────────────────
 class FaceAnalyzer:
-    """MediaPipe-based face mesh for mouth ROI detection and visualization."""
+    """Face/mouth detection: MediaPipe preferred, OpenCV Haar cascade fallback."""
 
-    MOUTH_OUTER = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185]
-    MOUTH_INNER = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 191]
-    LIP_TOP = [13]
-    LIP_BOTTOM = [14]
+    MOUTH_OUTER = [61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185]
+    MOUTH_INNER = [78,95,88,178,87,14,317,402,318,324,308,415,310,311,312,13,82,81,80,191]
 
     def __init__(self):
-        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False, max_num_faces=1,
-            refine_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5
-        )
+        self.face_mesh = None
+        self._backend = 'none'
+        self._cascade = None
+
+        if _HAS_MEDIAPIPE:
+            try:
+                self.face_mesh = _mp.solutions.face_mesh.FaceMesh(
+                    static_image_mode=False, max_num_faces=1,
+                    refine_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+                self._backend = 'mediapipe'
+            except Exception:
+                pass
+
+        if self._backend == 'none':
+            try:
+                p = os.path.join(cv2.data.haarcascades, 'haarcascade_frontalface_default.xml')
+                self._cascade = cv2.CascadeClassifier(p)
+                if not self._cascade.empty():
+                    self._backend = 'opencv'
+            except Exception:
+                pass
+
+    @property
+    def available(self): return self._backend != 'none'
+    @property
+    def backend_name(self): return self._backend
 
     def analyze_frame(self, frame):
-        """Returns (annotated_frame, mouth_roi, mouth_open_ratio, landmarks)."""
+        if self._backend == 'mediapipe': return self._mp(frame)
+        if self._backend == 'opencv': return self._cv(frame)
+        return frame.copy(), None, 0.0, None
+
+    def _mp(self, frame):
         h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb)
-        annotated = frame.copy()
-        mouth_roi = None
-        open_ratio = 0.0
-        landmarks = None
+        out = frame.copy()
+        roi, ratio = None, 0.0
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = self.face_mesh.process(rgb)
+            if res.multi_face_landmarks:
+                lm = res.multi_face_landmarks[0]
+                pts = [(int(lm.landmark[i].x*w), int(lm.landmark[i].y*h)) for i in self.MOUTH_OUTER]
+                if pts:
+                    arr = np.array(pts)
+                    x1, y1 = arr.min(0) - 20; x2, y2 = arr.max(0) + 20
+                    x1, y1, x2, y2 = max(0,x1), max(0,y1), min(w,x2), min(h,y2)
+                    roi = (x1, y1, x2, y2)
+                    cv2.rectangle(out, (x1,y1), (x2,y2), (137,180,250), 2)
+                    for i in self.MOUTH_OUTER:
+                        cv2.circle(out, (int(lm.landmark[i].x*w), int(lm.landmark[i].y*h)), 2, (166,227,161), -1)
+                    for i in self.MOUTH_INNER:
+                        cv2.circle(out, (int(lm.landmark[i].x*w), int(lm.landmark[i].y*h)), 2, (180,190,254), -1)
+                    t, b = lm.landmark[13], lm.landmark[14]
+                    l, r = lm.landmark[61], lm.landmark[291]
+                    mh = math.sqrt((t.x-b.x)**2+(t.y-b.y)**2)
+                    mw = math.sqrt((l.x-r.x)**2+(l.y-r.y)**2)
+                    ratio = mh / max(mw, 0.001)
+                    col = (166,227,161) if ratio > 0.06 else (108,112,134)
+                    cv2.putText(out, "SPEAKING" if ratio>0.06 else "SILENT", (x1,y1-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+        except: pass
+        return out, roi, ratio, None
 
-        if results.multi_face_landmarks:
-            face_lm = results.multi_face_landmarks[0]
-            landmarks = face_lm
-
-            # Extract mouth region
-            mouth_pts = []
-            for idx in self.MOUTH_OUTER:
-                lm = face_lm.landmark[idx]
-                mouth_pts.append((int(lm.x * w), int(lm.y * h)))
-
-            if mouth_pts:
-                pts = np.array(mouth_pts)
-                x_min, y_min = pts.min(axis=0)
-                x_max, y_max = pts.max(axis=0)
-                pad = 20
-                x_min = max(0, x_min - pad)
-                y_min = max(0, y_min - pad)
-                x_max = min(w, x_max + pad)
-                y_max = min(h, y_max + pad)
-                mouth_roi = (x_min, y_min, x_max, y_max)
-
-                # Draw mouth ROI
-                cv2.rectangle(annotated, (x_min, y_min), (x_max, y_max), (137, 180, 250), 2)
-
-                # Draw mouth landmarks
-                for idx in self.MOUTH_OUTER:
-                    lm = face_lm.landmark[idx]
-                    px, py = int(lm.x * w), int(lm.y * h)
-                    cv2.circle(annotated, (px, py), 2, (166, 227, 161), -1)
-
-                for idx in self.MOUTH_INNER:
-                    lm = face_lm.landmark[idx]
-                    px, py = int(lm.x * w), int(lm.y * h)
-                    cv2.circle(annotated, (px, py), 2, (180, 190, 254), -1)
-
-                # Calculate mouth open ratio
-                top = face_lm.landmark[13]
-                bottom = face_lm.landmark[14]
-                left = face_lm.landmark[61]
-                right = face_lm.landmark[291]
-                mouth_height = math.sqrt((top.x - bottom.x)**2 + (top.y - bottom.y)**2)
-                mouth_width = math.sqrt((left.x - right.x)**2 + (left.y - right.y)**2)
-                open_ratio = mouth_height / max(mouth_width, 0.001)
-
-                # Draw face outline (jawline)
-                jaw_indices = list(range(0, 17)) + [234, 127, 162, 21, 54, 103, 67, 109]
-                for idx in [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234]:
-                    lm = face_lm.landmark[idx]
-                    px, py = int(lm.x * w), int(lm.y * h)
-                    cv2.circle(annotated, (px, py), 1, (69, 71, 90), -1)
-
-                # Status indicator
-                status_color = (166, 227, 161) if open_ratio > 0.06 else (108, 112, 134)
-                status_text = "SPEAKING" if open_ratio > 0.06 else "SILENT"
-                cv2.putText(annotated, status_text, (x_min, y_min - 8),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1, cv2.LINE_AA)
-
-        return annotated, mouth_roi, open_ratio, landmarks
+    def _cv(self, frame):
+        h, w = frame.shape[:2]
+        out = frame.copy()
+        roi, ratio = None, 0.0
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self._cascade.detectMultiScale(gray, 1.1, 5, minSize=(80,80))
+            if len(faces) > 0:
+                fx,fy,fw,fh = faces[0]
+                cv2.rectangle(out, (fx,fy), (fx+fw,fy+fh), (69,71,90), 1)
+                mx1, my1 = max(0,fx+int(fw*0.2)), max(0,fy+int(fh*0.65))
+                mx2, my2 = min(w,fx+int(fw*0.8)), min(h,fy+fh+5)
+                roi = (mx1, my1, mx2, my2)
+                cv2.rectangle(out, (mx1,my1), (mx2,my2), (137,180,250), 2)
+                mg = gray[my1:my2, mx1:mx2]
+                if mg.size > 0:
+                    gx = cv2.Sobel(mg, cv2.CV_64F, 1, 0, ksize=3)
+                    gy = cv2.Sobel(mg, cv2.CV_64F, 0, 1, ksize=3)
+                    ratio = min(np.mean(np.sqrt(gx**2+gy**2)) / 50.0, 0.3)
+                cv2.putText(out, "DETECTED", (mx1,my1-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (137,180,250), 1, cv2.LINE_AA)
+        except: pass
+        return out, roi, ratio, None
 
     def close(self):
-        self.face_mesh.close()
+        if self.face_mesh:
+            try: self.face_mesh.close()
+            except: pass
 
 
 # ── Video Segmenter ─────────────────────────────────────────────────────────
 class VideoSegmenter:
-    """Segments video into speech/silence regions based on mouth movement analysis."""
-
-    def __init__(self, min_speech_duration=0.5, min_silence_duration=0.3, open_threshold=0.06):
-        self.min_speech_frames = int(min_speech_duration * 25)
-        self.min_silence_frames = int(min_silence_duration * 25)
-        self.open_threshold = open_threshold
+    def __init__(self, threshold=0.06):
+        self.threshold = threshold
 
     def segment(self, video_path, progress_cb=None, log_cb=None):
-        """Analyze video and return speech segments as [(start_sec, end_sec), ...]."""
         cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {video_path}")
-
+        if not cap.isOpened(): raise RuntimeError(f"Cannot open: {video_path}")
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         analyzer = FaceAnalyzer()
+        if not analyzer.available:
+            cap.release()
+            if log_cb: log_cb("⚠️  No face detection — whole video as one segment")
+            return [(0.0, total/fps)]
 
-        if log_cb: log_cb(f"📐 Analyzing {total_frames} frames at {fps:.1f} fps...")
-
-        open_ratios = []
-        frame_idx = 0
-        sample_rate = max(1, int(fps / 10))  # Sample ~10 frames/sec for speed
-
+        if log_cb: log_cb(f"📐 Analyzing {total} frames ({analyzer.backend_name})...")
+        ratios = []; idx = 0; step = max(1, int(fps/10))
         while True:
             ret, frame = cap.read()
-            if not ret:
-                break
-            if frame_idx % sample_rate == 0:
-                _, _, ratio, _ = analyzer.analyze_frame(frame)
-                open_ratios.append((frame_idx, ratio))
-            frame_idx += 1
-            if progress_cb and frame_idx % 50 == 0:
-                progress_cb(int(frame_idx / max(total_frames, 1) * 100))
+            if not ret: break
+            if idx % step == 0:
+                _, _, r, _ = analyzer.analyze_frame(frame)
+                ratios.append((idx, r))
+            idx += 1
+            if progress_cb and idx % 50 == 0: progress_cb(int(idx/max(total,1)*100))
+        cap.release(); analyzer.close()
+        if not ratios: return [(0.0, total/fps)]
 
-        cap.release()
-        analyzer.close()
-
-        if not open_ratios:
-            return [(0.0, total_frames / fps)]
-
-        # Detect speech segments
-        segments = []
-        in_speech = False
-        speech_start = 0
-        silence_count = 0
-
-        for frame_num, ratio in open_ratios:
-            if ratio > self.open_threshold:
-                if not in_speech:
-                    speech_start = frame_num
-                    in_speech = True
-                silence_count = 0
-            else:
-                if in_speech:
-                    silence_count += sample_rate
-                    if silence_count >= self.min_silence_frames:
-                        end_frame = frame_num - silence_count
-                        if (end_frame - speech_start) >= self.min_speech_frames:
-                            segments.append((speech_start / fps, end_frame / fps))
-                        in_speech = False
-                        silence_count = 0
-
-        # Close final segment
-        if in_speech:
-            end_frame = open_ratios[-1][0]
-            if (end_frame - speech_start) >= self.min_speech_frames:
-                segments.append((speech_start / fps, end_frame / fps))
-
-        if log_cb: log_cb(f"🔍 Found {len(segments)} speech segments")
-
-        # If no segments detected, return whole video as one segment
-        if not segments:
-            segments = [(0.0, total_frames / fps)]
-
-        return segments
+        ms, ml = int(0.5*25), int(0.3*25)
+        segs, speech, start, sil = [], False, 0, 0
+        for fn, r in ratios:
+            if r > self.threshold:
+                if not speech: start = fn; speech = True
+                sil = 0
+            elif speech:
+                sil += step
+                if sil >= ml:
+                    end = fn - sil
+                    if (end-start) >= ms: segs.append((start/fps, end/fps))
+                    speech = False; sil = 0
+        if speech:
+            end = ratios[-1][0]
+            if (end-start) >= ms: segs.append((start/fps, end/fps))
+        if log_cb: log_cb(f"🔍 Found {len(segs)} speech segments")
+        return segs if segs else [(0.0, total/fps)]
 
 
-# ── Inference Backends ──────────────────────────────────────────────────────
-class ReplicateBackend:
-    """Cloud inference via Replicate API (Auto-AVSR model) using direct HTTP requests."""
+# ══════════════════════════════════════════════════════════════════════════════
+# INFERENCE BACKENDS
+# ══════════════════════════════════════════════════════════════════════════════
 
-    API_BASE = "https://api.replicate.com/v1"
-    MODEL_VERSION = "basord/lip-reading-ai-vsr"
+class HuggingFaceSpaceBackend:
+    """FREE inference via public HuggingFace Gradio Spaces — no token, no signup."""
 
-    def __init__(self, api_token):
-        self.api_token = api_token
-        self.headers = {
-            "Authorization": f"Token {api_token}",
-            "Content-Type": "application/json",
-        }
+    KNOWN_SPACES = [
+        "https://mpc001-auto-avsr.hf.space",
+        "https://vumichien-av-hubert.hf.space",
+    ]
 
-    def _upload_file(self, file_path):
-        """Upload file to Replicate's file hosting and return the serving URL."""
-        # Create upload URL
-        resp = requests.post(
-            f"{self.API_BASE}/files",
-            headers={
-                "Authorization": f"Token {self.api_token}",
-            },
-            files={"content": (os.path.basename(file_path), open(file_path, "rb"), "video/mp4")},
-            data={"content_type": "video/mp4"},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        serving_url = data.get("urls", {}).get("get", "")
-        if not serving_url:
-            serving_url = data.get("url", "")
-        if not serving_url:
-            raise RuntimeError(f"Upload succeeded but no serving URL returned: {data}")
-        return serving_url
-
-    def _get_latest_version(self):
-        """Resolve the latest version ID for the model."""
-        resp = requests.get(
-            f"{self.API_BASE}/models/{self.MODEL_VERSION}/versions",
-            headers=self.headers,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        versions = resp.json().get("results", [])
-        if not versions:
-            raise RuntimeError(f"No versions found for model {self.MODEL_VERSION}")
-        return versions[0]["id"]
+    def __init__(self, custom_url=""):
+        self.custom_url = custom_url.strip().rstrip('/')
 
     def transcribe(self, video_path, log_cb=None):
-        """Send video to Replicate and return transcription text."""
-        if log_cb: log_cb("☁️  Uploading video to Replicate...")
+        spaces = []
+        if self.custom_url: spaces.append(self.custom_url)
+        spaces.extend(self.KNOWN_SPACES)
+        last_err = None
 
+        for base in spaces:
+            name = base.split("//")[1].split(".")[0] if "//" in base else base
+            try:
+                if log_cb: log_cb(f"🤗 Trying Space: {name}...")
+
+                # Check reachability
+                try:
+                    requests.get(base, timeout=15)
+                except requests.exceptions.ConnectionError:
+                    if log_cb: log_cb(f"   ❌ Unreachable"); continue
+
+                # Upload file
+                if log_cb: log_cb(f"   📤 Uploading video...")
+                with open(video_path, 'rb') as f:
+                    up = requests.post(f"{base}/upload",
+                        files={"files": (os.path.basename(video_path), f, "video/mp4")}, timeout=120)
+                up.raise_for_status()
+                uploaded = up.json()
+                fpath = uploaded[0] if isinstance(uploaded, list) else uploaded
+
+                # Predict (try multiple Gradio API versions)
+                if log_cb: log_cb(f"   🧠 Running inference (may take 30-120s)...")
+                session = hashlib.md5(str(random.random()).encode()).hexdigest()[:12]
+
+                for api_path in ["/api/predict", "/run/predict"]:
+                    for payload in [
+                        {"data": [{"path": fpath, "orig_name": os.path.basename(video_path)}], "session_hash": session},
+                        {"data": [fpath], "session_hash": session},
+                    ]:
+                        try:
+                            r = requests.post(f"{base}{api_path}", json=payload, timeout=300)
+                            if r.status_code in (404, 422): continue
+                            r.raise_for_status()
+                            data = r.json().get("data", [])
+                            if data and data[0]:
+                                if log_cb: log_cb(f"   ✅ Got result")
+                                return str(data[0]).strip()
+                        except (requests.exceptions.HTTPError, requests.exceptions.Timeout):
+                            continue
+
+                if log_cb: log_cb(f"   ⚠️  No valid response")
+            except Exception as e:
+                last_err = str(e)
+                if log_cb: log_cb(f"   ❌ {e}")
+
+        raise RuntimeError(
+            f"All HuggingFace Spaces unavailable.\n"
+            f"Last error: {last_err}\n\n"
+            f"Options: Try again later, use Local backend, or set a custom Space URL.")
+
+
+class LocalAutoAVSRBackend:
+    """FREE local inference — auto-downloads PyTorch + Auto-AVSR."""
+
+    MODEL_DIR = os.path.join(get_config_dir(), 'models', 'auto_avsr')
+    REPO_URL = "https://github.com/mpc001/auto_avsr.git"
+
+    def __init__(self):
+        self._ready = False
+
+    def _pip(self, pkgs, log_cb=None):
+        for pkg in pkgs:
+            mod = pkg.split('[')[0].split('=')[0].split('>')[0].split('<')[0].replace('-','_').lower()
+            if mod == 'opencv_python': mod = 'cv2'
+            try: __import__(mod); continue
+            except ImportError: pass
+            if log_cb: log_cb(f"   📦 Installing {pkg}...")
+            for fl in [[], ['--user'], ['--break-system-packages']]:
+                try:
+                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg, '-q'] + fl, timeout=600)
+                    break
+                except: continue
+
+    def _ensure_setup(self, log_cb=None):
+        if self._ready: return
+        if log_cb: log_cb("🔧 Setting up local Auto-AVSR...")
+
+        # PyTorch
         try:
-            # Upload the file first
-            file_url = self._upload_file(video_path)
-            if log_cb: log_cb(f"☁️  File uploaded, resolving model version...")
+            import torch
+            if log_cb: log_cb(f"   ✅ PyTorch {torch.__version__} (CUDA: {torch.cuda.is_available()})")
+        except ImportError:
+            if log_cb: log_cb("   📦 Installing PyTorch (may take several minutes)...")
+            for cmd in [
+                [sys.executable, '-m', 'pip', 'install', 'torch', 'torchvision', 'torchaudio', '--index-url', 'https://download.pytorch.org/whl/cu121', '-q'],
+                [sys.executable, '-m', 'pip', 'install', 'torch', 'torchvision', 'torchaudio', '-q'],
+            ]:
+                try: subprocess.check_call(cmd, timeout=900); break
+                except: continue
+            import torch
+            if log_cb: log_cb(f"   ✅ PyTorch {torch.__version__}")
 
-            # Get latest model version
-            version_id = self._get_latest_version()
-            if log_cb: log_cb(f"☁️  Creating prediction (version {version_id[:12]}...)...")
+        self._pip(['sentencepiece', 'pytorch-lightning', 'hydra-core', 'omegaconf'], log_cb)
 
-            # Create prediction
-            resp = requests.post(
-                f"{self.API_BASE}/predictions",
-                headers=self.headers,
-                json={
-                    "version": version_id,
-                    "input": {"video": file_url},
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            prediction = resp.json()
-            pred_id = prediction["id"]
-            get_url = prediction.get("urls", {}).get("get", f"{self.API_BASE}/predictions/{pred_id}")
+        # Clone repo
+        os.makedirs(self.MODEL_DIR, exist_ok=True)
+        repo = os.path.join(self.MODEL_DIR, 'repo')
+        if not os.path.isdir(repo):
+            if log_cb: log_cb("   📥 Cloning Auto-AVSR repository...")
+            try:
+                subprocess.check_call(['git', 'clone', '--depth', '1', self.REPO_URL, repo], timeout=120)
+            except FileNotFoundError:
+                raise RuntimeError("Git not installed. Install from https://git-scm.com/download/win")
+            except Exception as e:
+                raise RuntimeError(f"Clone failed: {e}")
 
-            if log_cb: log_cb(f"☁️  Prediction {pred_id} queued, polling for result...")
+        # Install package
+        if log_cb: log_cb("   📦 Installing Auto-AVSR package...")
+        try:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-e', repo, '-q'], timeout=300)
+        except:
+            if repo not in sys.path: sys.path.insert(0, repo)
 
-            # Poll for completion
-            max_wait = 300  # 5 minutes
-            poll_interval = 2
-            elapsed = 0
-            while elapsed < max_wait:
-                time.sleep(poll_interval)
-                elapsed += poll_interval
+        self._ready = True
+        if log_cb: log_cb("   ✅ Local setup complete")
 
-                resp = requests.get(get_url, headers=self.headers, timeout=30)
-                resp.raise_for_status()
-                prediction = resp.json()
-                status = prediction.get("status", "")
+    def transcribe(self, video_path, log_cb=None):
+        self._ensure_setup(log_cb)
+        import torch
 
-                if status == "succeeded":
-                    output = prediction.get("output", "")
-                    if isinstance(output, dict):
-                        return output.get("text", output.get("transcription", str(output)))
-                    elif isinstance(output, list):
-                        return " ".join(str(o) for o in output)
-                    return str(output) if output else "(no output)"
+        repo = os.path.join(self.MODEL_DIR, 'repo')
+        if repo not in sys.path: sys.path.insert(0, repo)
 
-                elif status == "failed":
-                    error_msg = prediction.get("error", "Unknown error")
-                    raise RuntimeError(f"Prediction failed: {error_msg}")
+        if log_cb: log_cb("🧠 Running local inference...")
 
-                elif status == "canceled":
-                    raise RuntimeError("Prediction was canceled")
+        # Try CLI inference
+        for script in ['infer.py', 'eval.py', 'predict.py', 'demo.py']:
+            sp = os.path.join(repo, script)
+            if os.path.exists(sp):
+                try:
+                    result = subprocess.run(
+                        [sys.executable, sp, '--video_path', video_path, '--modality', 'video'],
+                        capture_output=True, text=True, timeout=300, cwd=repo)
+                    if result.returncode == 0:
+                        lines = result.stdout.strip().split('\n')
+                        for line in reversed(lines):
+                            l = line.strip()
+                            if l and not l.startswith(('[','=','W','I','D')): return l
+                        return result.stdout.strip()
+                    else:
+                        err = result.stderr.strip() or result.stdout.strip()
+                        if log_cb: log_cb(f"   ⚠️  {script} error: {err[:200]}")
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError("Inference timed out (>5min)")
+                except Exception as e:
+                    if log_cb: log_cb(f"   ⚠️  {script}: {e}")
 
-                if log_cb and elapsed % 10 == 0:
-                    log_cb(f"☁️  Still processing... ({elapsed}s elapsed, status: {status})")
+        raise RuntimeError(
+            f"Could not run inference. The Auto-AVSR repo may require additional setup.\n\n"
+            f"Manual steps:\n  cd {repo}\n  python infer.py --video_path \"{video_path}\" --modality video")
 
-            raise RuntimeError(f"Prediction timed out after {max_wait}s")
 
+class ReplicateBackend:
+    """Cloud inference via Replicate API — requires token."""
+
+    API = "https://api.replicate.com/v1"
+    MODEL = "basord/lip-reading-ai-vsr"
+
+    def __init__(self, token):
+        self.token = token
+        self.h = {"Authorization": f"Token {token}", "Content-Type": "application/json"}
+
+    def transcribe(self, video_path, log_cb=None):
+        if log_cb: log_cb("☁️  Uploading to Replicate...")
+        try:
+            # Upload
+            with open(video_path, 'rb') as f:
+                r = requests.post(f"{self.API}/files", headers={"Authorization": f"Token {self.token}"},
+                    files={"content": (os.path.basename(video_path), f, "video/mp4")},
+                    data={"content_type": "video/mp4"}, timeout=120)
+            r.raise_for_status()
+            url = r.json().get("urls", {}).get("get", "") or r.json().get("url", "")
+            if not url: raise RuntimeError("No upload URL returned")
+
+            # Version
+            r = requests.get(f"{self.API}/models/{self.MODEL}/versions", headers=self.h, timeout=30)
+            r.raise_for_status()
+            ver = r.json()["results"][0]["id"]
+
+            # Predict
+            if log_cb: log_cb("☁️  Running prediction...")
+            r = requests.post(f"{self.API}/predictions", headers=self.h,
+                json={"version": ver, "input": {"video": url}}, timeout=30)
+            r.raise_for_status()
+            pred = r.json()
+            get_url = pred.get("urls", {}).get("get", f"{self.API}/predictions/{pred['id']}")
+
+            for elapsed in range(0, 300, 2):
+                time.sleep(2)
+                p = requests.get(get_url, headers=self.h, timeout=30).json()
+                st = p.get("status", "")
+                if st == "succeeded":
+                    out = p.get("output", "")
+                    if isinstance(out, dict): return out.get("text", str(out))
+                    if isinstance(out, list): return " ".join(str(o) for o in out)
+                    return str(out) if out else "(empty)"
+                if st in ("failed", "canceled"):
+                    raise RuntimeError(f"Prediction {st}: {p.get('error','?')}")
+                if log_cb and elapsed % 10 == 0 and elapsed > 0:
+                    log_cb(f"☁️  Waiting... ({elapsed}s)")
+            raise RuntimeError("Timed out")
         except requests.exceptions.HTTPError as e:
-            body = ""
-            try: body = e.response.text[:300]
-            except: pass
-            raise RuntimeError(f"Replicate API HTTP {e.response.status_code}: {body}")
-        except Exception as e:
-            if "Replicate" in str(type(e).__name__) or "RuntimeError" in str(type(e).__name__):
-                raise
-            raise RuntimeError(f"Replicate API error: {e}")
+            raise RuntimeError(f"Replicate HTTP {e.response.status_code}: {e.response.text[:200]}")
 
 
 class DirectAPIBackend:
-    """Direct HTTP-based inference for custom endpoints."""
-
-    def __init__(self, endpoint_url, api_key=""):
-        self.endpoint_url = endpoint_url
-        self.api_key = api_key
-
+    def __init__(self, url, key=""):
+        self.url = url; self.key = key
     def transcribe(self, video_path, log_cb=None):
-        if log_cb: log_cb(f"🌐 Sending to {self.endpoint_url}...")
-        headers = {}
-        if self.api_key:
-            headers['Authorization'] = f'Bearer {self.api_key}'
-
+        if log_cb: log_cb(f"🌐 Sending to {self.url}...")
+        h = {"Authorization": f"Bearer {self.key}"} if self.key else {}
         with open(video_path, 'rb') as f:
-            resp = requests.post(
-                self.endpoint_url,
-                files={'video': (os.path.basename(video_path), f, 'video/mp4')},
-                headers=headers, timeout=300
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get('text', data.get('transcription', str(data)))
+            r = requests.post(self.url, files={'video': (os.path.basename(video_path), f, 'video/mp4')},
+                headers=h, timeout=300)
+        r.raise_for_status()
+        d = r.json()
+        return d.get('text', d.get('transcription', str(d)))
 
 
-# ── Export Utilities ────────────────────────────────────────────────────────
-def format_srt_time(seconds):
-    td = timedelta(seconds=seconds)
-    total_secs = int(td.total_seconds())
-    ms = int((td.total_seconds() - total_secs) * 1000)
-    hrs = total_secs // 3600
-    mins = (total_secs % 3600) // 60
-    secs = total_secs % 60
-    return f"{hrs:02d}:{mins:02d}:{secs:02d},{ms:03d}"
+# ── Export ──────────────────────────────────────────────────────────────────
+def _ts(s):
+    h=int(s)//3600; m=(int(s)%3600)//60; sec=s-h*3600-m*60
+    return f"{h:02d}:{m:02d}:{sec:06.3f}".replace('.',',')
 
-def export_srt(results, filepath):
-    with open(filepath, 'w', encoding='utf-8') as f:
-        for i, r in enumerate(results, 1):
-            f.write(f"{i}\n")
-            f.write(f"{format_srt_time(r['start'])} --> {format_srt_time(r['end'])}\n")
-            f.write(f"{r['text']}\n\n")
+def export_srt(res, fp):
+    with open(fp,'w',encoding='utf-8') as f:
+        for i,r in enumerate(res,1): f.write(f"{i}\n{_ts(r['start'])} --> {_ts(r['end'])}\n{r['text']}\n\n")
 
-def export_txt(results, filepath):
-    with open(filepath, 'w', encoding='utf-8') as f:
-        for r in results:
-            ts = f"[{format_srt_time(r['start'])} -> {format_srt_time(r['end'])}]"
-            f.write(f"{ts} {r['text']}\n")
+def export_txt(res, fp):
+    with open(fp,'w',encoding='utf-8') as f:
+        for r in res: f.write(f"[{_ts(r['start'])} -> {_ts(r['end'])}] {r['text']}\n")
 
-def export_json(results, filepath):
-    with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump({'results': results, 'version': APP_VERSION}, f, indent=2)
+def export_json(res, fp):
+    with open(fp,'w',encoding='utf-8') as f: json.dump({'results':res,'version':APP_VERSION},f,indent=2)
 
 
-# ── Worker Threads ──────────────────────────────────────────────────────────
+# ── Workers ─────────────────────────────────────────────────────────────────
 class ProcessingWorker(QThread):
-    progress = pyqtSignal(int)
-    log = pyqtSignal(str)
-    segment_result = pyqtSignal(dict)
-    finished = pyqtSignal(list)
-    error = pyqtSignal(str)
+    progress = pyqtSignal(int); log = pyqtSignal(str)
+    segment_result = pyqtSignal(dict); finished = pyqtSignal(list); error = pyqtSignal(str)
 
-    def __init__(self, video_path, backend, segments=None):
+    def __init__(self, vpath, backend, segs=None):
         super().__init__()
-        self.video_path = video_path
-        self.backend = backend
-        self.segments = segments
-        self._cancelled = False
+        self.vpath, self.backend, self.segs = vpath, backend, segs
+        self._stop = False
 
-    def cancel(self):
-        self._cancelled = True
+    def cancel(self): self._stop = True
 
     def run(self):
         try:
             results = []
-
-            if self.segments and len(self.segments) > 1:
-                # Process each segment separately
-                temp_dir = tempfile.mkdtemp(prefix='lipsight_')
-                cap = cv2.VideoCapture(self.video_path)
+            if self.segs and len(self.segs) > 1:
+                td = tempfile.mkdtemp(prefix='lipsight_')
+                cap = cv2.VideoCapture(self.vpath)
                 fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 cap.release()
 
-                for i, (start, end) in enumerate(self.segments):
-                    if self._cancelled:
-                        break
-
-                    self.log.emit(f"🎬 Processing segment {i+1}/{len(self.segments)} [{start:.1f}s - {end:.1f}s]")
-
-                    # Extract segment using ffmpeg or opencv
-                    seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
+                for i,(s,e) in enumerate(self.segs):
+                    if self._stop: break
+                    self.log.emit(f"🎬 Segment {i+1}/{len(self.segs)} [{s:.1f}s-{e:.1f}s]")
+                    sp = os.path.join(td, f"seg_{i:04d}.mp4")
                     try:
-                        subprocess.run([
-                            'ffmpeg', '-y', '-i', self.video_path,
-                            '-ss', str(start), '-t', str(end - start),
-                            '-c:v', 'libx264', '-an', '-preset', 'ultrafast',
-                            seg_path
-                        ], capture_output=True, timeout=60)
-                    except (FileNotFoundError, subprocess.TimeoutExpired):
-                        # Fallback: use OpenCV to extract segment
-                        seg_path = self._extract_segment_cv(self.video_path, start, end, seg_path, fps, w, h)
+                        subprocess.run(['ffmpeg','-y','-i',self.vpath,'-ss',str(s),'-t',str(e-s),
+                            '-c:v','libx264','-an','-preset','ultrafast',sp], capture_output=True, timeout=60)
+                    except:
+                        cap2 = cv2.VideoCapture(self.vpath)
+                        wr = cv2.VideoWriter(sp, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w,h))
+                        cap2.set(cv2.CAP_PROP_POS_FRAMES, int(s*fps))
+                        for _ in range(int((e-s)*fps)):
+                            ok,fr = cap2.read()
+                            if not ok: break
+                            wr.write(fr)
+                        wr.release(); cap2.release()
 
-                    if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
+                    if os.path.exists(sp) and os.path.getsize(sp) > 0:
                         try:
-                            text = self.backend.transcribe(seg_path, log_cb=self.log.emit)
-                            result = {'start': start, 'end': end, 'text': text.strip(), 'segment': i+1}
-                            results.append(result)
-                            self.segment_result.emit(result)
-                        except Exception as e:
-                            self.log.emit(f"⚠️  Segment {i+1} failed: {e}")
-
-                    self.progress.emit(int((i + 1) / len(self.segments) * 100))
-
-                # Cleanup temp
-                try:
-                    import shutil
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                except: pass
+                            txt = self.backend.transcribe(sp, log_cb=self.log.emit)
+                            r = {'start':s,'end':e,'text':txt.strip(),'segment':i+1}
+                            results.append(r); self.segment_result.emit(r)
+                        except Exception as ex:
+                            self.log.emit(f"⚠️  Segment {i+1}: {ex}")
+                    self.progress.emit(int((i+1)/len(self.segs)*100))
+                shutil.rmtree(td, ignore_errors=True)
             else:
-                # Process entire video as one segment
                 self.log.emit("🎬 Processing entire video...")
                 self.progress.emit(10)
-                text = self.backend.transcribe(self.video_path, log_cb=self.log.emit)
-                duration = self._get_duration(self.video_path)
-                result = {'start': 0.0, 'end': duration, 'text': text.strip(), 'segment': 1}
-                results.append(result)
-                self.segment_result.emit(result)
-                self.progress.emit(100)
+                txt = self.backend.transcribe(self.vpath, log_cb=self.log.emit)
+                cap = cv2.VideoCapture(self.vpath)
+                dur = cap.get(cv2.CAP_PROP_FRAME_COUNT) / (cap.get(cv2.CAP_PROP_FPS) or 25.0)
+                cap.release()
+                r = {'start':0.0,'end':dur,'text':txt.strip(),'segment':1}
+                results.append(r); self.segment_result.emit(r); self.progress.emit(100)
 
-            self.log.emit(f"✅ Processing complete — {len(results)} segment(s) transcribed")
+            self.log.emit(f"✅ Complete — {len(results)} segment(s)")
             self.finished.emit(results)
-
         except Exception as e:
             self.error.emit(str(e))
 
-    def _extract_segment_cv(self, video_path, start, end, out_path, fps, w, h):
-        """Extract segment using OpenCV as fallback."""
-        cap = cv2.VideoCapture(video_path)
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
 
-        start_frame = int(start * fps)
-        end_frame = int(end * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
-        for _ in range(end_frame - start_frame):
-            ret, frame = cap.read()
-            if not ret: break
-            writer.write(frame)
-
-        writer.release()
-        cap.release()
-        return out_path
-
-    def _get_duration(self, video_path):
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        cap.release()
-        return frames / fps
+class SegmentWorker(QThread):
+    progress = pyqtSignal(int); log = pyqtSignal(str)
+    finished = pyqtSignal(list); error = pyqtSignal(str)
+    def __init__(self, vp): super().__init__(); self.vp = vp
+    def run(self):
+        try: self.finished.emit(VideoSegmenter().segment(self.vp, self.progress.emit, self.log.emit))
+        except Exception as e: self.error.emit(str(e))
 
 
-class SegmentationWorker(QThread):
-    progress = pyqtSignal(int)
-    log = pyqtSignal(str)
-    finished = pyqtSignal(list)
-    error = pyqtSignal(str)
-
-    def __init__(self, video_path):
-        super().__init__()
-        self.video_path = video_path
-
+class FrameWorker(QThread):
+    frame_ready = pyqtSignal(QImage, float, dict); finished = pyqtSignal()
+    def __init__(self, vp, n): super().__init__(); self.vp, self.n = vp, n
     def run(self):
         try:
-            segmenter = VideoSegmenter()
-            segments = segmenter.segment(
-                self.video_path, progress_cb=self.progress.emit, log_cb=self.log.emit
-            )
-            self.finished.emit(segments)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class FrameLoaderWorker(QThread):
-    frame_ready = pyqtSignal(QImage, float, dict)
-    finished = pyqtSignal()
-
-    def __init__(self, video_path, frame_num):
-        super().__init__()
-        self.video_path = video_path
-        self.frame_num = frame_num
-
-    def run(self):
-        cap = cv2.VideoCapture(self.video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        cap.set(cv2.CAP_PROP_POS_FRAMES, self.frame_num)
-        ret, frame = cap.read()
-        cap.release()
-
-        if ret:
-            analyzer = FaceAnalyzer()
-            annotated, mouth_roi, open_ratio, _ = analyzer.analyze_frame(frame)
-            analyzer.close()
-
-            h, w, ch = annotated.shape
-            rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-            img = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
-
-            info = {
-                'mouth_roi': mouth_roi,
-                'open_ratio': open_ratio,
-                'timestamp': self.frame_num / fps
-            }
-            self.frame_ready.emit(img, self.frame_num / fps, info)
+            cap = cv2.VideoCapture(self.vp)
+            if not cap.isOpened(): self.finished.emit(); return
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            cap.set(cv2.CAP_PROP_POS_FRAMES, self.n)
+            ok, frame = cap.read(); cap.release()
+            if not ok or frame is None: self.finished.emit(); return
+            try:
+                a = FaceAnalyzer()
+                out, roi, ratio, _ = a.analyze_frame(frame) if a.available else (frame, None, 0.0, None)
+                a.close()
+            except: out, roi, ratio = frame, None, 0.0
+            rgb = np.ascontiguousarray(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
+            h, w, ch = rgb.shape
+            img = QImage(rgb.data, w, h, ch*w, QImage.Format.Format_RGB888).copy()
+            self.frame_ready.emit(img, self.n/fps, {'open_ratio': ratio})
+        except: pass
         self.finished.emit()
 
 
-# ── Video Preview Widget ────────────────────────────────────────────────────
+# ── Widgets ─────────────────────────────────────────────────────────────────
 class VideoPreview(QLabel):
-    """Video frame display with aspect-ratio scaling."""
-
     def __init__(self):
-        super().__init__()
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(480, 270)
-        self.setStyleSheet(f"""
-            background-color: {COLORS['crust']};
-            border: 1px solid {COLORS['surface1']};
-            border-radius: 8px;
-        """)
-        self._pixmap = None
-        self._show_placeholder()
+        super().__init__(); self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(480,270)
+        self.setStyleSheet(f"background-color:{C['crust']};border:1px solid {C['surface1']};border-radius:8px;color:{C['overlay0']};font-size:16px;")
+        self._pm = None; self.setText("📹  Load a video to begin")
+    def set_frame(self, img):
+        self._pm = QPixmap.fromImage(img); self._upd()
+    def _upd(self):
+        if self._pm: self.setPixmap(self._pm.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+    def resizeEvent(self, e): super().resizeEvent(e); self._upd()
 
-    def _show_placeholder(self):
-        self.setText("📹  Load a video to begin")
-        self.setStyleSheet(self.styleSheet() + f"color: {COLORS['overlay0']}; font-size: 16px;")
-
-    def set_frame(self, qimage):
-        self._pixmap = QPixmap.fromImage(qimage)
-        self._update_display()
-
-    def _update_display(self):
-        if self._pixmap:
-            scaled = self._pixmap.scaled(
-                self.size(), Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            )
-            self.setPixmap(scaled)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._update_display()
-
-    def clear_frame(self):
-        self._pixmap = None
-        self._show_placeholder()
-
-
-# ── Toast Notification ──────────────────────────────────────────────────────
 class Toast(QLabel):
-    def __init__(self, parent, message, color=COLORS['green'], duration=2500):
-        super().__init__(message, parent)
-        self.setStyleSheet(f"""
-            background-color: {COLORS['surface0']};
-            color: {color};
-            border: 1px solid {color};
-            border-radius: 8px;
-            padding: 10px 20px;
-            font-size: 13px;
-            font-weight: bold;
-        """)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.adjustSize()
-        self.move(parent.width() // 2 - self.width() // 2, 20)
-        self.show()
-        self.raise_()
-        QTimer.singleShot(duration, self.deleteLater)
+    def __init__(self, p, msg, col=C['green'], ms=2500):
+        super().__init__(msg, p)
+        self.setStyleSheet(f"background-color:{C['surface0']};color:{col};border:1px solid {col};border-radius:8px;padding:10px 20px;font-size:13px;font-weight:bold;")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter); self.adjustSize()
+        self.move(p.width()//2-self.width()//2, 20); self.show(); self.raise_()
+        QTimer.singleShot(ms, self.deleteLater)
 
 
-# ── Main Window ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN WINDOW
+# ══════════════════════════════════════════════════════════════════════════════
+BACKENDS = ["🤗 HuggingFace Space (Free)", "💻 Local Auto-AVSR (Free)", "☁️ Replicate API (Token)", "🌐 Custom Endpoint"]
+
 class LipSightWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
-        self.resize(1280, 820)
-        self.setMinimumSize(1000, 650)
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}"); self.resize(1300,840); self.setMinimumSize(1000,650)
+        self.cfg = load_config()
+        self.video_path = None; self.video_info = {}; self.segments = []; self.results = []
+        self._fw = self._sw = self._pw = None
+        self._build(); self._connect()
+        fa = FaceAnalyzer()
+        self._log(f"✅ Face detection: {fa.backend_name}" if fa.available else "⚠️  No face detection — segmentation disabled")
+        fa.close()
+        self._log(f"🔧 Backend: {BACKENDS[self.cfg.get('backend_index', 0)]}")
 
-        self.config = load_config()
-        self.video_path = None
-        self.video_info = {}
-        self.segments = []
-        self.results = []
-        self._frame_worker = None
-        self._seg_worker = None
-        self._proc_worker = None
+    def _build(self):
+        cw = QWidget(); self.setCentralWidget(cw)
+        root = QVBoxLayout(cw); root.setSpacing(0); root.setContentsMargins(0,0,0,0)
 
-        self._build_ui()
-        self._connect_signals()
+        # Header
+        hdr = QWidget(); hdr.setFixedHeight(56)
+        hdr.setStyleSheet(f"background-color:{C['mantle']};border-bottom:1px solid {C['surface0']};")
+        hl = QHBoxLayout(hdr); hl.setContentsMargins(16,0,16,0)
+        lg = QLabel(f"👁️  {APP_NAME}"); lg.setStyleSheet(f"font-size:18px;font-weight:bold;color:{C['blue']};background:transparent;border:none;")
+        hl.addWidget(lg)
+        vl = QLabel(f"v{APP_VERSION}"); vl.setStyleSheet(f"font-size:11px;color:{C['overlay0']};background:transparent;border:none;")
+        hl.addWidget(vl); hl.addStretch()
+        self.badge = QLabel(BACKENDS[self.cfg.get('backend_index',0)])
+        self.badge.setStyleSheet(f"background-color:{C['surface0']};color:{C['teal']};padding:4px 12px;border-radius:12px;font-size:12px;font-weight:bold;")
+        hl.addWidget(self.badge); root.addWidget(hdr)
 
-    def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setSpacing(0)
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        body = QWidget(); bl = QHBoxLayout(body); bl.setContentsMargins(12,12,12,0); bl.setSpacing(12)
 
-        # ── Header Bar ──────────────────────────────────────────────────
-        header_bar = QWidget()
-        header_bar.setFixedHeight(56)
-        header_bar.setStyleSheet(f"background-color: {COLORS['mantle']}; border-bottom: 1px solid {COLORS['surface0']};")
-        hbar_layout = QHBoxLayout(header_bar)
-        hbar_layout.setContentsMargins(16, 0, 16, 0)
+        # Left
+        left = QWidget(); ll = QVBoxLayout(left); ll.setContentsMargins(0,0,0,0); ll.setSpacing(8)
+        self.preview = VideoPreview(); ll.addWidget(self.preview, stretch=1)
 
-        logo = QLabel(f"👁️  {APP_NAME}")
-        logo.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {COLORS['blue']}; background: transparent; border: none;")
-        hbar_layout.addWidget(logo)
+        sr = QHBoxLayout()
+        self.t_lbl = QLabel("00:00.000"); self.t_lbl.setStyleSheet(f"color:{C['overlay1']};font-family:monospace;font-size:12px;")
+        sr.addWidget(self.t_lbl)
+        self.slider = QSlider(Qt.Orientation.Horizontal); self.slider.setMinimum(0); self.slider.setMaximum(0)
+        sr.addWidget(self.slider, stretch=1)
+        self.d_lbl = QLabel("00:00.000"); self.d_lbl.setStyleSheet(f"color:{C['overlay1']};font-family:monospace;font-size:12px;")
+        sr.addWidget(self.d_lbl); ll.addLayout(sr)
 
-        ver = QLabel(f"v{APP_VERSION}")
-        ver.setStyleSheet(f"font-size: 11px; color: {COLORS['overlay0']}; background: transparent; border: none;")
-        hbar_layout.addWidget(ver)
+        br = QHBoxLayout(); br.setSpacing(8)
+        self.b_load = QPushButton("📂  Load Video"); br.addWidget(self.b_load)
+        self.b_analyze = QPushButton("🔍  Analyze"); self.b_analyze.setObjectName("accentBtn"); self.b_analyze.setEnabled(False); br.addWidget(self.b_analyze)
+        self.b_process = QPushButton("🧠  Lip Read"); self.b_process.setObjectName("greenBtn"); self.b_process.setEnabled(False); br.addWidget(self.b_process)
+        self.b_cancel = QPushButton("⏹"); self.b_cancel.setObjectName("dangerBtn"); self.b_cancel.setEnabled(False); self.b_cancel.setFixedWidth(50); br.addWidget(self.b_cancel)
+        ll.addLayout(br)
 
-        hbar_layout.addStretch()
+        self.prog = QProgressBar(); self.prog.setFixedHeight(6); self.prog.setTextVisible(False); ll.addWidget(self.prog)
 
-        model_label = QLabel("Model:")
-        model_label.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 12px; background: transparent; border: none;")
-        hbar_layout.addWidget(model_label)
+        sts = QHBoxLayout(); sts.setSpacing(16)
+        self.sf = self._mk("FRAMES"); self.sfps = self._mk("FPS"); self.sres = self._mk("RES"); self.sseg = self._mk("SEGS"); self.smo = self._mk("MOUTH")
+        for s in [self.sf,self.sfps,self.sres,self.sseg,self.smo]: sts.addWidget(s)
+        sts.addStretch(); ll.addLayout(sts)
+        bl.addWidget(left, stretch=6)
 
-        self.model_badge = QLabel("Auto-AVSR (Replicate)")
-        self.model_badge.setStyleSheet(f"""
-            background-color: {COLORS['surface0']}; color: {COLORS['teal']};
-            padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold;
-        """)
-        hbar_layout.addWidget(self.model_badge)
+        # Right tabs
+        tabs = QTabWidget(); tabs.setMinimumWidth(380)
 
-        main_layout.addWidget(header_bar)
+        # Results
+        rw = QWidget(); rl = QVBoxLayout(rw); rl.setContentsMargins(8,8,8,8)
+        self.tbl = QTableWidget(); self.tbl.setColumnCount(3)
+        self.tbl.setHorizontalHeaderLabels(["Time","Dur","Transcription"])
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.tbl.setAlternatingRowColors(True); self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); self.tbl.verticalHeader().setVisible(False)
+        rl.addWidget(self.tbl)
+        self.txte = QTextEdit(); self.txte.setReadOnly(True); self.txte.setMaximumHeight(120)
+        self.txte.setPlaceholderText("Full transcript..."); rl.addWidget(self.txte)
+        er = QHBoxLayout()
+        self.bsrt=QPushButton("💾 SRT"); self.bsrt.setObjectName("secondaryBtn"); self.bsrt.setEnabled(False)
+        self.btxt=QPushButton("📄 TXT"); self.btxt.setObjectName("secondaryBtn"); self.btxt.setEnabled(False)
+        self.bjsn=QPushButton("{ } JSON"); self.bjsn.setObjectName("secondaryBtn"); self.bjsn.setEnabled(False)
+        self.bcpy=QPushButton("📋 Copy"); self.bcpy.setObjectName("secondaryBtn"); self.bcpy.setEnabled(False)
+        for b in [self.bsrt,self.btxt,self.bjsn,self.bcpy]: er.addWidget(b)
+        rl.addLayout(er); tabs.addTab(rw, "📝 Results")
 
-        # ── Body ────────────────────────────────────────────────────────
-        body = QWidget()
-        body_layout = QHBoxLayout(body)
-        body_layout.setContentsMargins(12, 12, 12, 0)
-        body_layout.setSpacing(12)
+        # Log
+        lw = QWidget(); ll2 = QVBoxLayout(lw); ll2.setContentsMargins(8,8,8,8)
+        self.logw = QPlainTextEdit(); self.logw.setReadOnly(True)
+        self.logw.setStyleSheet(f"font-family:'Consolas','Cascadia Code',monospace;font-size:12px;background-color:{C['crust']};")
+        ll2.addWidget(self.logw); tabs.addTab(lw, "📋 Log")
 
-        # Left panel — video + controls
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(8)
+        # Settings
+        sw = QWidget(); sl = QVBoxLayout(sw); sl.setContentsMargins(12,12,12,12); sl.setSpacing(10)
 
-        # Video preview
-        self.video_preview = VideoPreview()
-        left_layout.addWidget(self.video_preview, stretch=1)
+        bg = QGroupBox("Inference Backend"); bgl = QVBoxLayout(bg)
+        self.be_combo = QComboBox(); self.be_combo.addItems(BACKENDS)
+        self.be_combo.setCurrentIndex(self.cfg.get('backend_index',0))
+        self.be_combo.currentIndexChanged.connect(self._on_be)
+        bgl.addWidget(self.be_combo); sl.addWidget(bg)
 
-        # Scrubber
-        scrub_row = QHBoxLayout()
-        self.time_label = QLabel("00:00.000")
-        self.time_label.setStyleSheet(f"color: {COLORS['overlay1']}; font-family: monospace; font-size: 12px;")
-        scrub_row.addWidget(self.time_label)
+        self.stack = QStackedWidget()
 
-        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
-        self.frame_slider.setMinimum(0)
-        self.frame_slider.setMaximum(0)
-        scrub_row.addWidget(self.frame_slider, stretch=1)
+        # P0: HF
+        p0 = QWidget(); p0l = QVBoxLayout(p0); p0l.setContentsMargins(0,4,0,0)
+        h0 = QLabel("🤗 Free — no signup. Connects to public Gradio Spaces.\nSpaces may sleep; wake-up takes 30-60s.")
+        h0.setObjectName("dimLabel"); h0.setWordWrap(True); p0l.addWidget(h0)
+        p0l.addWidget(QLabel("Custom Space URL (optional):"))
+        self.hf_url = QLineEdit(); self.hf_url.setPlaceholderText("https://user-space.hf.space")
+        self.hf_url.setText(self.cfg.get('hf_space_url','')); p0l.addWidget(self.hf_url); p0l.addStretch()
+        self.stack.addWidget(p0)
 
-        self.duration_label = QLabel("00:00.000")
-        self.duration_label.setStyleSheet(f"color: {COLORS['overlay1']}; font-family: monospace; font-size: 12px;")
-        scrub_row.addWidget(self.duration_label)
-        left_layout.addLayout(scrub_row)
+        # P1: Local
+        p1 = QWidget(); p1l = QVBoxLayout(p1); p1l.setContentsMargins(0,4,0,0)
+        h1 = QLabel("💻 Free & offline. Auto-downloads PyTorch + model (~4GB).\nGPU recommended. First run takes several minutes.")
+        h1.setObjectName("dimLabel"); h1.setWordWrap(True); p1l.addWidget(h1)
+        self.b_dl = QPushButton("📥  Pre-Download Model"); self.b_dl.setObjectName("accentBtn")
+        self.b_dl.clicked.connect(self._pre_dl); p1l.addWidget(self.b_dl); p1l.addStretch()
+        self.stack.addWidget(p1)
 
-        # Action buttons
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
+        # P2: Replicate
+        p2 = QWidget(); p2l = QVBoxLayout(p2); p2l.setContentsMargins(0,4,0,0)
+        p2l.addWidget(QLabel("API Token:"))
+        self.rep_tok = QLineEdit(); self.rep_tok.setPlaceholderText("r8_xxx"); self.rep_tok.setEchoMode(QLineEdit.EchoMode.Password)
+        self.rep_tok.setText(self.cfg.get('replicate_api_token','')); p2l.addWidget(self.rep_tok)
+        rh = QLabel("Get token at replicate.com/account/api-tokens"); rh.setObjectName("dimLabel"); p2l.addWidget(rh); p2l.addStretch()
+        self.stack.addWidget(p2)
 
-        self.btn_load = QPushButton("📂  Load Video")
-        btn_row.addWidget(self.btn_load)
+        # P3: Custom
+        p3 = QWidget(); p3l = QVBoxLayout(p3); p3l.setContentsMargins(0,4,0,0)
+        p3l.addWidget(QLabel("URL:")); self.ep_url = QLineEdit(); self.ep_url.setPlaceholderText("https://..."); self.ep_url.setText(self.cfg.get('custom_endpoint','')); p3l.addWidget(self.ep_url)
+        p3l.addWidget(QLabel("Key:")); self.ep_key = QLineEdit(); self.ep_key.setEchoMode(QLineEdit.EchoMode.Password); self.ep_key.setText(self.cfg.get('custom_endpoint_key','')); p3l.addWidget(self.ep_key); p3l.addStretch()
+        self.stack.addWidget(p3)
 
-        self.btn_analyze = QPushButton("🔍  Analyze Segments")
-        self.btn_analyze.setObjectName("accentBtn")
-        self.btn_analyze.setEnabled(False)
-        btn_row.addWidget(self.btn_analyze)
+        sl.addWidget(self.stack); self.stack.setCurrentIndex(self.cfg.get('backend_index',0))
 
-        self.btn_process = QPushButton("🧠  Lip Read")
-        self.btn_process.setEnabled(False)
-        btn_row.addWidget(self.btn_process)
+        sg = QGroupBox("Segmentation"); sgl = QVBoxLayout(sg)
+        self.chk_seg = QCheckBox("Auto-segment by mouth movement"); self.chk_seg.setChecked(self.cfg.get('auto_segment',True)); sgl.addWidget(self.chk_seg)
+        sl.addWidget(sg)
 
-        self.btn_cancel = QPushButton("⏹  Cancel")
-        self.btn_cancel.setObjectName("dangerBtn")
-        self.btn_cancel.setEnabled(False)
-        self.btn_cancel.setFixedWidth(100)
-        btn_row.addWidget(self.btn_cancel)
-
-        left_layout.addLayout(btn_row)
-
-        # Progress
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(6)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setValue(0)
-        left_layout.addWidget(self.progress_bar)
-
-        # Stats row
-        stats_row = QHBoxLayout()
-        stats_row.setSpacing(16)
-        self.stat_frames = self._make_stat("FRAMES", "—")
-        self.stat_fps = self._make_stat("FPS", "—")
-        self.stat_resolution = self._make_stat("RESOLUTION", "—")
-        self.stat_segments = self._make_stat("SEGMENTS", "—")
-        self.stat_mouth = self._make_stat("MOUTH", "—")
-        stats_row.addWidget(self.stat_frames)
-        stats_row.addWidget(self.stat_fps)
-        stats_row.addWidget(self.stat_resolution)
-        stats_row.addWidget(self.stat_segments)
-        stats_row.addWidget(self.stat_mouth)
-        stats_row.addStretch()
-        left_layout.addLayout(stats_row)
-
-        body_layout.addWidget(left_panel, stretch=6)
-
-        # Right panel — tabs (Results, Log, Settings)
-        right_panel = QTabWidget()
-        right_panel.setMinimumWidth(360)
-
-        # Results tab
-        results_widget = QWidget()
-        results_layout = QVBoxLayout(results_widget)
-        results_layout.setContentsMargins(8, 8, 8, 8)
-
-        self.results_table = QTableWidget()
-        self.results_table.setColumnCount(3)
-        self.results_table.setHorizontalHeaderLabels(["Time", "Duration", "Transcription"])
-        self.results_table.horizontalHeader().setStretchLastSection(True)
-        self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.results_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.results_table.setAlternatingRowColors(True)
-        self.results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.results_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.results_table.verticalHeader().setVisible(False)
-        results_layout.addWidget(self.results_table)
-
-        # Full transcript
-        self.full_transcript = QTextEdit()
-        self.full_transcript.setReadOnly(True)
-        self.full_transcript.setMaximumHeight(120)
-        self.full_transcript.setPlaceholderText("Full transcript will appear here...")
-        results_layout.addWidget(self.full_transcript)
-
-        # Export buttons
-        export_row = QHBoxLayout()
-        self.btn_export_srt = QPushButton("💾  SRT")
-        self.btn_export_srt.setObjectName("secondaryBtn")
-        self.btn_export_srt.setEnabled(False)
-        export_row.addWidget(self.btn_export_srt)
-
-        self.btn_export_txt = QPushButton("📄  TXT")
-        self.btn_export_txt.setObjectName("secondaryBtn")
-        self.btn_export_txt.setEnabled(False)
-        export_row.addWidget(self.btn_export_txt)
-
-        self.btn_export_json = QPushButton("{ }  JSON")
-        self.btn_export_json.setObjectName("secondaryBtn")
-        self.btn_export_json.setEnabled(False)
-        export_row.addWidget(self.btn_export_json)
-
-        self.btn_copy = QPushButton("📋  Copy")
-        self.btn_copy.setObjectName("secondaryBtn")
-        self.btn_copy.setEnabled(False)
-        export_row.addWidget(self.btn_copy)
-
-        results_layout.addLayout(export_row)
-        right_panel.addTab(results_widget, "📝 Results")
-
-        # Log tab
-        log_widget = QWidget()
-        log_layout = QVBoxLayout(log_widget)
-        log_layout.setContentsMargins(8, 8, 8, 8)
-        self.log_text = QPlainTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setStyleSheet(f"""
-            font-family: 'Consolas', 'Cascadia Code', monospace;
-            font-size: 12px;
-            background-color: {COLORS['crust']};
-        """)
-        log_layout.addWidget(self.log_text)
-        right_panel.addTab(log_widget, "📋 Log")
-
-        # Settings tab
-        settings_widget = QWidget()
-        settings_layout = QVBoxLayout(settings_widget)
-        settings_layout.setContentsMargins(12, 12, 12, 12)
-        settings_layout.setSpacing(12)
-
-        # API Settings
-        api_group = QGroupBox("Replicate API")
-        api_layout = QVBoxLayout(api_group)
-
-        api_layout.addWidget(QLabel("API Token:"))
-        self.api_token_input = QLineEdit()
-        self.api_token_input.setPlaceholderText("r8_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
-        self.api_token_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_token_input.setText(self.config.get('replicate_api_token', ''))
-        api_layout.addWidget(self.api_token_input)
-
-        api_hint = QLabel("Get your token at replicate.com/account/api-tokens")
-        api_hint.setObjectName("dimLabel")
-        api_hint.setWordWrap(True)
-        api_layout.addWidget(api_hint)
-
-        settings_layout.addWidget(api_group)
-
-        # Custom Endpoint
-        endpoint_group = QGroupBox("Custom Endpoint (Optional)")
-        endpoint_layout = QVBoxLayout(endpoint_group)
-
-        endpoint_layout.addWidget(QLabel("URL:"))
-        self.endpoint_input = QLineEdit()
-        self.endpoint_input.setPlaceholderText("https://your-server.com/api/lip-read")
-        self.endpoint_input.setText(self.config.get('custom_endpoint', ''))
-        endpoint_layout.addWidget(self.endpoint_input)
-
-        endpoint_layout.addWidget(QLabel("API Key:"))
-        self.endpoint_key_input = QLineEdit()
-        self.endpoint_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.endpoint_key_input.setText(self.config.get('custom_endpoint_key', ''))
-        endpoint_layout.addWidget(self.endpoint_key_input)
-
-        settings_layout.addWidget(endpoint_group)
-
-        # Segmentation settings
-        seg_group = QGroupBox("Segmentation")
-        seg_layout = QVBoxLayout(seg_group)
-
-        self.chk_auto_segment = QCheckBox("Auto-segment by mouth movement")
-        self.chk_auto_segment.setChecked(self.config.get('auto_segment', True))
-        self.chk_auto_segment.setStyleSheet(f"color: {COLORS['text']};")
-        seg_layout.addWidget(self.chk_auto_segment)
-
-        seg_layout.addWidget(QLabel("Mouth open threshold:"))
-        self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
-        self.threshold_slider.setMinimum(3)
-        self.threshold_slider.setMaximum(15)
-        self.threshold_slider.setValue(int(self.config.get('open_threshold', 6)))
-        seg_layout.addWidget(self.threshold_slider)
-
-        settings_layout.addWidget(seg_group)
-
-        # Backend selector
-        backend_group = QGroupBox("Inference Backend")
-        backend_layout = QVBoxLayout(backend_group)
-        self.backend_combo = QComboBox()
-        self.backend_combo.addItems(["Replicate API (Cloud)", "Custom Endpoint"])
-        self.backend_combo.setCurrentIndex(self.config.get('backend_index', 0))
-        backend_layout.addWidget(self.backend_combo)
-        settings_layout.addWidget(backend_group)
-
-        self.btn_save_settings = QPushButton("💾  Save Settings")
-        settings_layout.addWidget(self.btn_save_settings)
-
-        settings_layout.addStretch()
-        right_panel.addTab(settings_widget, "⚙️ Settings")
-
-        body_layout.addWidget(right_panel, stretch=4)
-        main_layout.addWidget(body, stretch=1)
-
-        # ── Status Bar ──────────────────────────────────────────────────
+        self.b_save = QPushButton("💾  Save Settings"); sl.addWidget(self.b_save); sl.addStretch()
+        tabs.addTab(sw, "⚙️ Settings")
+        bl.addWidget(tabs, stretch=4); root.addWidget(body, stretch=1)
         self.statusBar().showMessage("Ready — load a video to begin")
 
-    def _make_stat(self, label_text, value_text):
-        w = QWidget()
-        w.setFixedWidth(90)
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        val = QLabel(value_text)
-        val.setObjectName("statValue")
-        val.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        val.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {COLORS['blue']};")
-        layout.addWidget(val)
-        lbl = QLabel(label_text)
-        lbl.setObjectName("statLabel")
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setStyleSheet(f"font-size: 10px; color: {COLORS['overlay1']}; text-transform: uppercase;")
-        layout.addWidget(lbl)
-        w._val_label = val
-        return w
+    def _mk(self, lbl):
+        w = QWidget(); w.setFixedWidth(80); l = QVBoxLayout(w); l.setContentsMargins(0,0,0,0); l.setSpacing(0)
+        v = QLabel("—"); v.setAlignment(Qt.AlignmentFlag.AlignCenter); v.setStyleSheet(f"font-size:15px;font-weight:bold;color:{C['blue']};"); l.addWidget(v)
+        b = QLabel(lbl); b.setAlignment(Qt.AlignmentFlag.AlignCenter); b.setStyleSheet(f"font-size:10px;color:{C['overlay1']};"); l.addWidget(b)
+        w._v = v; return w
 
-    def _update_stat(self, widget, value):
-        widget._val_label.setText(str(value))
+    def _sv(self, w, val): w._v.setText(str(val))
 
-    def _connect_signals(self):
-        self.btn_load.clicked.connect(self._load_video)
-        self.btn_analyze.clicked.connect(self._analyze_segments)
-        self.btn_process.clicked.connect(self._start_processing)
-        self.btn_cancel.clicked.connect(self._cancel_processing)
-        self.btn_save_settings.clicked.connect(self._save_settings)
-        self.frame_slider.valueChanged.connect(self._on_frame_scrub)
-        self.btn_export_srt.clicked.connect(lambda: self._export('srt'))
-        self.btn_export_txt.clicked.connect(lambda: self._export('txt'))
-        self.btn_export_json.clicked.connect(lambda: self._export('json'))
-        self.btn_copy.clicked.connect(self._copy_transcript)
+    def _connect(self):
+        self.b_load.clicked.connect(self._load); self.b_analyze.clicked.connect(self._analyze)
+        self.b_process.clicked.connect(self._process); self.b_cancel.clicked.connect(self._cancel)
+        self.b_save.clicked.connect(self._save); self.slider.valueChanged.connect(self._scrub)
+        self.bsrt.clicked.connect(lambda: self._export('srt')); self.btxt.clicked.connect(lambda: self._export('txt'))
+        self.bjsn.clicked.connect(lambda: self._export('json')); self.bcpy.clicked.connect(self._copy)
 
-    # ── Video Loading ───────────────────────────────────────────────────
-    def _load_video(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select Video File", "",
-            "Video Files (*.mp4 *.mov *.avi *.mkv *.webm);;All Files (*)"
-        )
-        if not path:
-            return
+    def _on_be(self, i): self.stack.setCurrentIndex(i); self.badge.setText(BACKENDS[i])
 
-        self.video_path = path
-        self.results = []
-        self.segments = []
-        self.results_table.setRowCount(0)
-        self.full_transcript.clear()
-        self._enable_exports(False)
-
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            self._log("❌ Failed to open video file")
-            return
-
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        duration = total_frames / fps
-        cap.release()
-
-        self.video_info = {'fps': fps, 'frames': total_frames, 'width': w, 'height': h, 'duration': duration}
-        self.frame_slider.setMaximum(total_frames - 1)
-        self.frame_slider.setValue(0)
-        self.duration_label.setText(self._fmt_time(duration))
-
-        self._update_stat(self.stat_frames, f"{total_frames:,}")
-        self._update_stat(self.stat_fps, f"{fps:.1f}")
-        self._update_stat(self.stat_resolution, f"{w}x{h}")
-        self._update_stat(self.stat_segments, "—")
-        self._update_stat(self.stat_mouth, "—")
-
-        self.btn_analyze.setEnabled(True)
-        self.btn_process.setEnabled(True)
-        self.statusBar().showMessage(f"Loaded: {os.path.basename(path)} — {self._fmt_time(duration)}")
-        self._log(f"📂 Loaded: {os.path.basename(path)}")
-        self._log(f"   {w}x{h} @ {fps:.1f}fps — {total_frames:,} frames — {self._fmt_time(duration)}")
-
-        # Load first frame
-        self._load_frame(0)
-
-    def _load_frame(self, frame_num):
-        if not self.video_path:
-            return
-        self._frame_worker = FrameLoaderWorker(self.video_path, frame_num)
-        self._frame_worker.frame_ready.connect(self._on_frame_loaded)
-        self._frame_worker.start()
-
-    def _on_frame_loaded(self, qimage, timestamp, info):
-        self.video_preview.set_frame(qimage)
-        self.time_label.setText(self._fmt_time(timestamp))
-        ratio = info.get('open_ratio', 0)
-        self._update_stat(self.stat_mouth, f"{ratio:.2f}")
-
-    def _on_frame_scrub(self, value):
-        self._load_frame(value)
-
-    # ── Segmentation ────────────────────────────────────────────────────
-    def _analyze_segments(self):
-        if not self.video_path:
-            return
-
-        self.btn_analyze.setEnabled(False)
-        self.btn_process.setEnabled(False)
-        self.progress_bar.setValue(0)
-        self._log("🔍 Starting mouth movement analysis...")
-
-        self._seg_worker = SegmentationWorker(self.video_path)
-        self._seg_worker.progress.connect(self.progress_bar.setValue)
-        self._seg_worker.log.connect(self._log)
-        self._seg_worker.finished.connect(self._on_segments_ready)
-        self._seg_worker.error.connect(self._on_segment_error)
-        self._seg_worker.start()
-
-    def _on_segments_ready(self, segments):
-        self.segments = segments
-        self._update_stat(self.stat_segments, str(len(segments)))
-        self.btn_analyze.setEnabled(True)
-        self.btn_process.setEnabled(True)
-        self.progress_bar.setValue(100)
-
-        self._log(f"✅ Found {len(segments)} speech segment(s):")
-        for i, (start, end) in enumerate(segments):
-            self._log(f"   [{i+1}] {self._fmt_time(start)} → {self._fmt_time(end)} ({end-start:.1f}s)")
-
-        Toast(self, f"  ✅  {len(segments)} speech segments detected  ", COLORS['green'])
-
-    def _on_segment_error(self, msg):
-        self._log(f"❌ Segmentation error: {msg}")
-        self.btn_analyze.setEnabled(True)
-        self.btn_process.setEnabled(True)
-        Toast(self, f"  ❌  Segmentation failed  ", COLORS['red'])
-
-    # ── Processing ──────────────────────────────────────────────────────
-    def _start_processing(self):
-        if not self.video_path:
-            return
-
-        # Validate backend
-        backend = self._get_backend()
-        if backend is None:
-            return
-
-        self.btn_process.setEnabled(False)
-        self.btn_analyze.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
-        self.progress_bar.setValue(0)
-        self.results = []
-        self.results_table.setRowCount(0)
-        self.full_transcript.clear()
-        self._enable_exports(False)
-
-        use_segments = self.chk_auto_segment.isChecked() and len(self.segments) > 1
-        segments = self.segments if use_segments else None
-
-        self._log("🧠 Starting lip reading inference...")
-        if segments:
-            self._log(f"   Processing {len(segments)} segments individually")
-
-        self._proc_worker = ProcessingWorker(self.video_path, backend, segments)
-        self._proc_worker.progress.connect(self.progress_bar.setValue)
-        self._proc_worker.log.connect(self._log)
-        self._proc_worker.segment_result.connect(self._on_segment_result)
-        self._proc_worker.finished.connect(self._on_processing_complete)
-        self._proc_worker.error.connect(self._on_processing_error)
-        self._proc_worker.start()
-
-    def _cancel_processing(self):
-        if self._proc_worker:
-            self._proc_worker.cancel()
-            self._log("⏹ Cancelling...")
-        self.btn_cancel.setEnabled(False)
-
-    def _get_backend(self):
-        idx = self.backend_combo.currentIndex()
-        if idx == 0:
-            token = self.api_token_input.text().strip()
-            if not token:
-                Toast(self, "  ⚠️  Set Replicate API token in Settings  ", COLORS['peach'])
-                return None
-            return ReplicateBackend(token)
-        else:
-            url = self.endpoint_input.text().strip()
-            if not url:
-                Toast(self, "  ⚠️  Set custom endpoint URL in Settings  ", COLORS['peach'])
-                return None
-            return DirectAPIBackend(url, self.endpoint_key_input.text().strip())
-
-    def _on_segment_result(self, result):
-        row = self.results_table.rowCount()
-        self.results_table.insertRow(row)
-
-        time_str = f"{self._fmt_time(result['start'])} → {self._fmt_time(result['end'])}"
-        dur = result['end'] - result['start']
-
-        self.results_table.setItem(row, 0, QTableWidgetItem(time_str))
-        self.results_table.setItem(row, 1, QTableWidgetItem(f"{dur:.1f}s"))
-        self.results_table.setItem(row, 2, QTableWidgetItem(result['text']))
-        self.results_table.scrollToBottom()
-
-    def _on_processing_complete(self, results):
-        self.results = results
-        self.btn_process.setEnabled(True)
-        self.btn_analyze.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
-        self._enable_exports(True)
-
-        # Build full transcript
-        full_text = ' '.join(r['text'] for r in results if r['text'])
-        self.full_transcript.setPlainText(full_text)
-
-        self.statusBar().showMessage(f"Complete — {len(results)} segment(s), {len(full_text.split())} words")
-        Toast(self, f"  ✅  Lip reading complete — {len(results)} segments  ", COLORS['green'])
-
-    def _on_processing_error(self, msg):
-        self._log(f"❌ Processing error: {msg}")
-        self.btn_process.setEnabled(True)
-        self.btn_analyze.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
-        Toast(self, f"  ❌  {msg[:80]}  ", COLORS['red'])
-
-    # ── Export ──────────────────────────────────────────────────────────
-    def _export(self, fmt):
-        if not self.results:
-            return
-
-        base_name = Path(self.video_path).stem if self.video_path else "lipsight"
-        filters = {
-            'srt': "SRT Subtitles (*.srt)",
-            'txt': "Text File (*.txt)",
-            'json': "JSON File (*.json)",
-        }
-
-        path, _ = QFileDialog.getSaveFileName(
-            self, f"Export {fmt.upper()}", f"{base_name}_lipsight.{fmt}",
-            filters.get(fmt, "All Files (*)")
-        )
-        if not path:
-            return
-
+    def _load(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Video (*.mp4 *.mov *.avi *.mkv *.webm);;All (*)")
+        if not p: return
         try:
-            if fmt == 'srt': export_srt(self.results, path)
-            elif fmt == 'txt': export_txt(self.results, path)
-            elif fmt == 'json': export_json(self.results, path)
-            self._log(f"💾 Exported to {path}")
-            Toast(self, f"  💾  Exported {fmt.upper()}  ", COLORS['green'])
-        except Exception as e:
-            self._log(f"❌ Export failed: {e}")
-            Toast(self, f"  ❌  Export failed  ", COLORS['red'])
+            self.video_path = p; self.results = []; self.segments = []; self.tbl.setRowCount(0); self.txte.clear(); self._exp(False)
+            cap = cv2.VideoCapture(p)
+            if not cap.isOpened(): self._log("❌ Can't open"); return
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0; frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)); dur = frames/fps; cap.release()
+            self.video_info = {'fps':fps,'frames':frames,'w':w,'h':h,'dur':dur}
+            self.slider.setMaximum(max(0,frames-1)); self.slider.setValue(0); self.d_lbl.setText(self._ft(dur))
+            self._sv(self.sf,f"{frames:,}"); self._sv(self.sfps,f"{fps:.1f}"); self._sv(self.sres,f"{w}x{h}"); self._sv(self.sseg,"—"); self._sv(self.smo,"—")
+            self.b_analyze.setEnabled(True); self.b_process.setEnabled(True)
+            self.statusBar().showMessage(f"Loaded: {os.path.basename(p)}")
+            self._log(f"📂 {os.path.basename(p)} — {w}x{h} @ {fps:.1f}fps — {frames:,} frames — {self._ft(dur)}")
+            self._lf(0)
+        except Exception as e: self._log(f"❌ {e}")
 
-    def _copy_transcript(self):
-        text = self.full_transcript.toPlainText()
-        if text:
-            QApplication.clipboard().setText(text)
-            Toast(self, "  📋  Copied to clipboard  ", COLORS['green'])
+    def _lf(self, n):
+        if not self.video_path: return
+        if self._fw and self._fw.isRunning(): return
+        self._fw = FrameWorker(self.video_path, n)
+        self._fw.frame_ready.connect(self._of); self._fw.start()
 
-    def _enable_exports(self, enabled):
-        self.btn_export_srt.setEnabled(enabled)
-        self.btn_export_txt.setEnabled(enabled)
-        self.btn_export_json.setEnabled(enabled)
-        self.btn_copy.setEnabled(enabled)
+    def _of(self, img, ts, info):
+        self.preview.set_frame(img); self.t_lbl.setText(self._ft(ts))
+        self._sv(self.smo, f"{info.get('open_ratio',0):.2f}")
 
-    # ── Settings ────────────────────────────────────────────────────────
-    def _save_settings(self):
-        self.config['replicate_api_token'] = self.api_token_input.text().strip()
-        self.config['custom_endpoint'] = self.endpoint_input.text().strip()
-        self.config['custom_endpoint_key'] = self.endpoint_key_input.text().strip()
-        self.config['auto_segment'] = self.chk_auto_segment.isChecked()
-        self.config['open_threshold'] = self.threshold_slider.value()
-        self.config['backend_index'] = self.backend_combo.currentIndex()
-        save_config(self.config)
-        Toast(self, "  ✅  Settings saved  ", COLORS['green'])
-        self._log("💾 Settings saved")
+    def _scrub(self, v): self._lf(v)
 
-    # ── Utilities ───────────────────────────────────────────────────────
-    def _log(self, msg):
-        ts = time.strftime("%H:%M:%S")
-        self.log_text.appendPlainText(f"[{ts}] {msg}")
+    def _analyze(self):
+        if not self.video_path: return
+        self.b_analyze.setEnabled(False); self.b_process.setEnabled(False); self.prog.setValue(0)
+        self._log("🔍 Analyzing..."); self._sw = SegmentWorker(self.video_path)
+        self._sw.progress.connect(self.prog.setValue); self._sw.log.connect(self._log)
+        self._sw.finished.connect(self._os)
+        self._sw.error.connect(lambda m: (self._log(f"❌ {m}"), self.b_analyze.setEnabled(True), self.b_process.setEnabled(True)))
+        self._sw.start()
+
+    def _os(self, segs):
+        self.segments = segs; self._sv(self.sseg, len(segs))
+        self.b_analyze.setEnabled(True); self.b_process.setEnabled(True); self.prog.setValue(100)
+        for i,(s,e) in enumerate(segs): self._log(f"   [{i+1}] {self._ft(s)} → {self._ft(e)} ({e-s:.1f}s)")
+        Toast(self, f"  ✅  {len(segs)} segments  ", C['green'])
+
+    def _process(self):
+        if not self.video_path: return
+        be = self._get_be()
+        if not be: return
+        self.b_process.setEnabled(False); self.b_analyze.setEnabled(False); self.b_cancel.setEnabled(True)
+        self.prog.setValue(0); self.results=[]; self.tbl.setRowCount(0); self.txte.clear(); self._exp(False)
+        segs = self.segments if (self.chk_seg.isChecked() and len(self.segments)>1) else None
+        self._log(f"🧠 Lip reading via {BACKENDS[self.be_combo.currentIndex()]}...")
+        self._pw = ProcessingWorker(self.video_path, be, segs)
+        self._pw.progress.connect(self.prog.setValue); self._pw.log.connect(self._log)
+        self._pw.segment_result.connect(self._or); self._pw.finished.connect(self._od)
+        self._pw.error.connect(self._oe); self._pw.start()
+
+    def _cancel(self):
+        if self._pw: self._pw.cancel(); self._log("⏹ Cancelling...")
+        self.b_cancel.setEnabled(False)
+
+    def _get_be(self):
+        i = self.be_combo.currentIndex()
+        if i == 0: return HuggingFaceSpaceBackend(self.hf_url.text().strip())
+        if i == 1: return LocalAutoAVSRBackend()
+        if i == 2:
+            t = self.rep_tok.text().strip()
+            if not t: Toast(self,"  ⚠️  Set token in Settings  ",C['peach']); return None
+            return ReplicateBackend(t)
+        u = self.ep_url.text().strip()
+        if not u: Toast(self,"  ⚠️  Set URL in Settings  ",C['peach']); return None
+        return DirectAPIBackend(u, self.ep_key.text().strip())
+
+    def _or(self, r):
+        row = self.tbl.rowCount(); self.tbl.insertRow(row)
+        self.tbl.setItem(row,0,QTableWidgetItem(f"{self._ft(r['start'])} → {self._ft(r['end'])}"))
+        self.tbl.setItem(row,1,QTableWidgetItem(f"{r['end']-r['start']:.1f}s"))
+        self.tbl.setItem(row,2,QTableWidgetItem(r['text'])); self.tbl.scrollToBottom()
+
+    def _od(self, res):
+        self.results = res; self.b_process.setEnabled(True); self.b_analyze.setEnabled(True); self.b_cancel.setEnabled(False); self._exp(True)
+        full = ' '.join(r['text'] for r in res if r['text']); self.txte.setPlainText(full)
+        self.statusBar().showMessage(f"Done — {len(res)} seg(s), {len(full.split())} words")
+        Toast(self, f"  ✅  {len(res)} segments transcribed  ", C['green'])
+
+    def _oe(self, msg):
+        self._log(f"❌ {msg}"); self.b_process.setEnabled(True); self.b_analyze.setEnabled(True); self.b_cancel.setEnabled(False)
+        Toast(self, f"  ❌  {msg[:80]}  ", C['red'])
+
+    def _export(self, fmt):
+        if not self.results: return
+        base = Path(self.video_path).stem if self.video_path else "lipsight"
+        p, _ = QFileDialog.getSaveFileName(self, f"Export", f"{base}_lipsight.{fmt}",
+            {"srt":"SRT (*.srt)","txt":"Text (*.txt)","json":"JSON (*.json)"}.get(fmt,"*"))
+        if not p: return
+        try:
+            {'srt':export_srt,'txt':export_txt,'json':export_json}[fmt](self.results, p)
+            self._log(f"💾 {p}"); Toast(self, "  💾  Exported  ", C['green'])
+        except Exception as e: self._log(f"❌ {e}"); Toast(self, "  ❌  Failed  ", C['red'])
+
+    def _copy(self):
+        t = self.txte.toPlainText()
+        if t: QApplication.clipboard().setText(t); Toast(self, "  📋  Copied  ", C['green'])
+
+    def _exp(self, on):
+        for b in [self.bsrt, self.btxt, self.bjsn, self.bcpy]: b.setEnabled(on)
+
+    def _save(self):
+        self.cfg.update({
+            'backend_index': self.be_combo.currentIndex(),
+            'hf_space_url': self.hf_url.text().strip(),
+            'replicate_api_token': self.rep_tok.text().strip(),
+            'custom_endpoint': self.ep_url.text().strip(),
+            'custom_endpoint_key': self.ep_key.text().strip(),
+            'auto_segment': self.chk_seg.isChecked(),
+        })
+        save_config(self.cfg); Toast(self, "  ✅  Saved  ", C['green']); self._log("💾 Settings saved")
+
+    def _pre_dl(self):
+        self._log("📥 Pre-downloading local model..."); self.b_dl.setEnabled(False); self.b_dl.setText("⏳ Downloading...")
+        class W(QThread):
+            log=pyqtSignal(str); done=pyqtSignal(bool,str)
+            def run(s):
+                try: LocalAutoAVSRBackend()._ensure_setup(s.log.emit); s.done.emit(True,"")
+                except Exception as e: s.done.emit(False,str(e))
+        w = W(); w.log.connect(self._log)
+        def fin(ok,msg):
+            self.b_dl.setEnabled(True)
+            if ok: self.b_dl.setText("✅  Model Ready"); Toast(self,"  ✅  Ready  ",C['green'])
+            else: self.b_dl.setText("📥  Pre-Download Model"); self._log(f"❌ {msg}"); Toast(self,f"  ❌  {msg[:60]}  ",C['red'])
+        w.done.connect(fin); w.start(); self._dlw = w
+
+    def _log(self, msg): self.logw.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
     @staticmethod
-    def _fmt_time(seconds):
-        m = int(seconds) // 60
-        s = seconds - m * 60
-        return f"{m:02d}:{s:06.3f}"
+    def _ft(s): m=int(s)//60; sec=s-m*60; return f"{m:02d}:{sec:06.3f}"
 
 
-# ── Entry Point ─────────────────────────────────────────────────────────────
+# ── Entry ───────────────────────────────────────────────────────────────────
 def main():
+    import traceback as _tb
+    def _exc(t,v,tb):
+        msg=''.join(_tb.format_exception(t,v,tb))
+        f=os.path.join(get_config_dir(),'crash.log')
+        try:
+            with open(f,'w') as fh: fh.write(msg)
+        except: pass
+        print(f"\n{'='*60}\n{APP_NAME} Crash\n{'='*60}\n{msg}")
+        if sys.platform=='win32':
+            try: import ctypes; ctypes.windll.user32.MessageBoxW(0,f"Log: {f}\n\n{msg[:500]}",f"{APP_NAME} Error",0x10)
+            except: pass
+        sys.__excepthook__(t,v,tb)
+    sys.excepthook = _exc
+
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setStyleSheet(DARK_STYLE)
-
-    # Font
-    font = app.font()
-    font.setFamily("Segoe UI, Roboto, Arial, sans-serif")
-    font.setPointSize(10)
-    app.setFont(font)
-
-    window = LipSightWindow()
-    window.show()
+    app.setStyle("Fusion"); app.setStyleSheet(DARK_STYLE)
+    font = app.font(); font.setFamily("Segoe UI"); font.setPointSize(10); app.setFont(font)
+    w = LipSightWindow(); w.show()
     sys.exit(app.exec())
 
 if __name__ == '__main__':
