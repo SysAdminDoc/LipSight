@@ -9,6 +9,25 @@ import sys, os, subprocess, json, time, tempfile, threading, math, hashlib, rand
 from pathlib import Path
 from datetime import timedelta
 
+
+# codex-branding:start
+def _branding_icon_path() -> Path:
+    candidates = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / "icon.png")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "icon.png")
+    current = Path(__file__).resolve()
+    candidates.extend([current.parent / "icon.png", current.parent.parent / "icon.png", current.parent.parent.parent / "icon.png"])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return Path("icon.png")
+# codex-branding:end
+
+
 # ── Auto-Bootstrap ──────────────────────────────────────────────────────────
 def _bootstrap():
     """Auto-install dependencies and configure prerequisites."""
@@ -57,7 +76,7 @@ except Exception:
 import requests
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
-from PyQt6.QtGui import *
+from PyQt6.QtGui import *, QIcon
 
 APP_NAME = "LipSight"
 APP_VERSION = "1.1.0"
@@ -1014,9 +1033,14 @@ def main():
     sys.excepthook = _exc
 
     app = QApplication(sys.argv)
+
+    branding_icon = QIcon(str(_branding_icon_path()))
+
+    app.setWindowIcon(branding_icon)
     app.setStyle("Fusion"); app.setStyleSheet(DARK_STYLE)
     font = app.font(); font.setFamily("Segoe UI"); font.setPointSize(10); app.setFont(font)
     w = LipSightWindow(); w.show()
+    w.setWindowIcon(branding_icon)
     sys.exit(app.exec())
 
 if __name__ == '__main__':
