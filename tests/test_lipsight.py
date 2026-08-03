@@ -232,6 +232,21 @@ def test_confidence_overlay_colors_each_word():
     assert 'maybe' in overlay and LipSight.C['red'] in overlay
 
 
+def test_correction_store_builds_fine_tune_dataset(tmp_path):
+    store = LipSight.CorrectionStore(tmp_path / 'corrections.jsonl')
+    store.record('clip.mp4', [{'segment': 1, 'before': 'helo', 'after': 'hello'}])
+
+    dataset = store.build_dataset(tmp_path / 'dataset.jsonl')
+    rows = [json.loads(line) for line in dataset.read_text(encoding='utf-8').splitlines()]
+
+    assert rows == [{
+        'input': 'helo',
+        'target': 'hello',
+        'segment': 1,
+        'video_path': 'clip.mp4',
+    }]
+
+
 @pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg is not installed')
 def test_burn_in_subtitles_writes_video(tmp_path):
     video = tmp_path / 'source.mp4'

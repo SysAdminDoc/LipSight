@@ -86,6 +86,7 @@ APP_NAME = "LipSight"
 APP_VERSION = "1.1.0"
 RESULT_SCHEMA_VERSION = "1.0"
 PROJECT_SCHEMA_VERSION = "1.0"
+CORRECTION_SCHEMA_VERSION = "1.0"
 PROJECT_MANIFEST = "project.json"
 VIDEO_EXTENSIONS = {'.avi', '.mkv', '.mov', '.mp4', '.webm'}
 
@@ -495,6 +496,60 @@ class SessionArchive:
                 if len(matches) >= limit:
                     break
         return matches
+
+
+class CorrectionStore:
+    """Persist review corrections as a fine-tuning-ready JSONL dataset."""
+
+    def __init__(self, path=None):
+        self.path = Path(path or os.path.join(get_config_dir(), 'corrections.jsonl')).expanduser()
+
+    def record(self, video_path, edits, metadata=None):
+        entry = {
+            'schema_version': CORRECTION_SCHEMA_VERSION,
+            'created_at': _utc_now(),
+            'video_path': str(Path(video_path).expanduser()) if video_path else None,
+            'edits': [dict(edit) for edit in edits or []],
+            'metadata': dict(metadata or {}),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open('a', encoding='utf-8') as dataset:
+            dataset.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        return entry
+
+    def build_dataset(self, output_path=None):
+        output_path = Path(output_path or self.path.with_name('fine_tune_dataset.jsonl')).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        rows = []
+        if self.path.is_file():
+            with self.path.open('r', encoding='utf-8') as source:
+                for line in source:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    for edit in entry.get('edits', []):
+                        rows.append({
+                            'input': str(edit.get('before', '')),
+                            'target': str(edit.get('after', '')),
+                            'segment': edit.get('segment'),
+                            'video_path': entry.get('video_path'),
+                        })
+        with output_path.open('w', encoding='utf-8', newline='\n') as dataset:
+            for row in rows:
+                dataset.write(json.dumps(row, ensure_ascii=False) + '\n')
+        return output_path
+
+    def fine_tune(self, command, output_path=None):
+        dataset = self.build_dataset(output_path)
+        parts = [part.format(dataset=str(dataset)) for part in _command_parts(command)]
+        if not parts:
+            raise ValueError('a fine-tune runner command is required')
+        completed = subprocess.run(parts, capture_output=True, text=True, timeout=3600)
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or 'fine-tune runner failed').strip().splitlines()[-1]
+            raise RuntimeError(detail)
+        return completed
 
 
 # ── Mouth preprocessing ────────────────────────────────────────────────────
@@ -1292,10 +1347,11 @@ class AVHuBERTBackend(CommandModelBackend):
 class FasterWhisperBackend:
     """Optional local audio transcription with word timestamps."""
 
-    def __init__(self, model='small', device='auto', compute_type='int8'):
+    def __init__(self, model='small', device='auto', compute_type='int8', language='auto'):
         self.model_name = model
         self.device = device
         self.compute_type = compute_type
+        self.language = language or 'auto'
         self._model = None
 
     def _ensure_model(self):
@@ -1321,7 +1377,10 @@ class FasterWhisperBackend:
             log_cb(f'🎙️  Transcribing audio with faster-whisper ({self.model_name})...')
         audio = _extract_audio(video_path)
         try:
-            segments, _info = self._ensure_model().transcribe(str(audio), word_timestamps=True, vad_filter=True)
+            options = {'word_timestamps': True, 'vad_filter': True}
+            if self.language and self.language.lower() != 'auto':
+                options['language'] = self.language
+            segments, _info = self._ensure_model().transcribe(str(audio), **options)
             words = []
             texts = []
             confidences = []
@@ -1696,6 +1755,7 @@ def create_backend(name, config=None):
             config.get('whisper_model', 'small'),
             config.get('whisper_device', 'auto'),
             config.get('whisper_compute_type', 'int8'),
+            config.get('language', 'auto'),
         )
     if normalized in ('whisper.cpp', 'whisper-cpp', 'whispercpp'):
         return WhisperCppBackend(config.get('whisper_cpp_model_path', ''), config.get('whisper_cpp_executable', 'whisper-cli'))
@@ -2127,6 +2187,8 @@ class LipSightWindow(QMainWindow):
         sg = QGroupBox("Segmentation"); sgl = QVBoxLayout(sg)
         self.chk_seg = QCheckBox("Auto-segment by mouth movement"); self.chk_seg.setChecked(self.cfg.get('auto_segment',True)); sgl.addWidget(self.chk_seg)
         self.chk_multi = QCheckBox("Label multiple speakers (A, B, ...)"); self.chk_multi.setChecked(self.cfg.get('multi_speaker', False)); sgl.addWidget(self.chk_multi)
+        self.chk_accessible = QCheckBox("Accessibility mode (large, high-contrast captions)")
+        self.chk_accessible.setChecked(self.cfg.get('accessibility_mode', False)); sgl.addWidget(self.chk_accessible)
         sl.addWidget(sg)
 
         self.b_save = QPushButton("💾  Save Settings"); sl.addWidget(self.b_save); sl.addStretch()
@@ -2150,6 +2212,8 @@ class LipSightWindow(QMainWindow):
         self.bvtt.clicked.connect(lambda: self._export('vtt')); self.bjsn.clicked.connect(lambda: self._export('json'))
         self.bcpy.clicked.connect(self._copy); self.breview.clicked.connect(self._apply_review)
         self.bproject.clicked.connect(self._save_project); self.curve.segments_changed.connect(self._segments_changed)
+        self.chk_accessible.toggled.connect(self._accessibility)
+        self._accessibility(self.chk_accessible.isChecked())
 
     def _on_be(self, i): self.stack.setCurrentIndex(i); self.badge.setText(BACKENDS[i])
 
@@ -2290,6 +2354,7 @@ class LipSightWindow(QMainWindow):
             'custom_endpoint_key': self.ep_key.text().strip(),
             'auto_segment': self.chk_seg.isChecked(),
             'multi_speaker': self.chk_multi.isChecked(),
+            'accessibility_mode': self.chk_accessible.isChecked(),
         })
         save_config(self.cfg); Toast(self, "  ✅  Saved  ", C['green']); self._log("💾 Settings saved")
 
@@ -2300,11 +2365,25 @@ class LipSightWindow(QMainWindow):
         self.segments = normalize_segments(segments)
         self._sv(self.sseg, len(self.segments))
 
+    def _accessibility(self, enabled):
+        if enabled:
+            self.txte.setStyleSheet(f"font-size:18px;color:#ffffff;background-color:{C['crust']};border:2px solid {C['blue']};")
+            self.confidence_view.setStyleSheet(f"font-size:16px;color:#ffffff;background-color:{C['crust']};border:2px solid {C['blue']};")
+            self.statusBar().showMessage("Accessibility mode enabled — large, high-contrast captions")
+        else:
+            self.txte.setStyleSheet('')
+            self.confidence_view.setStyleSheet(f"background-color:{C['mantle']};border:1px solid {C['surface0']};padding:4px;")
+
     def _apply_review(self):
         if not self.results:
             return
         self.results, edits = apply_review_text(self.results, self.txte.toPlainText())
         self.review_edits.extend(edits)
+        if edits:
+            try:
+                CorrectionStore(self.cfg.get('corrections_path', '') or None).record(self.video_path, edits)
+            except Exception as exc:
+                self._log(f"⚠️  Could not save correction dataset: {exc}")
         self.tbl.setRowCount(0)
         for result in self.results:
             self._or(result)
@@ -2367,6 +2446,7 @@ def build_cli_parser():
     parser.add_argument('--runner-command', default='', help='VALLR/AV-HuBERT local runner command')
     parser.add_argument('--runner-model', default='', help='VALLR/AV-HuBERT model path')
     parser.add_argument('--whisper-model', default='small', help='faster-whisper model name')
+    parser.add_argument('--language', default='auto', help='audio language code, or auto')
     parser.add_argument('--whisper-cpp-model', default='', help='whisper.cpp GGML model path')
     parser.add_argument('--whisper-cpp-executable', default='whisper-cli', help='whisper.cpp executable')
     parser.add_argument('--no-segmentation', action='store_true', help='process the full video as one segment')
@@ -2395,6 +2475,7 @@ def _cli_config(args):
         'avhubert_command': args.runner_command if args.backend.lower() in ('avhubert', 'av-hubert') else '',
         'avhubert_model_path': args.runner_model if args.backend.lower() in ('avhubert', 'av-hubert') else '',
         'whisper_model': args.whisper_model,
+        'language': args.language,
         'whisper_cpp_model_path': args.whisper_cpp_model,
         'whisper_cpp_executable': args.whisper_cpp_executable,
     }
