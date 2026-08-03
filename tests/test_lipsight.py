@@ -148,3 +148,19 @@ def test_super_resolution_fallback_upscales_small_crop():
     result = LipSight.SuperResolutionProcessor().enhance(crop, minimum_size=48)
 
     assert min(result.shape[:2]) >= 48
+
+
+def test_apply_review_text_preserves_timing_and_records_edits():
+    results = [
+        {'start': 0, 'end': 1, 'text': 'hello'},
+        {'start': 1, 'end': 2, 'text': 'world'},
+    ]
+
+    updated, edits = LipSight.apply_review_text(results, 'hi\nthere')
+
+    assert [result['text'] for result in updated] == ['hi', 'there']
+    assert updated[0]['start'] == 0.0 and updated[1]['end'] == 2.0
+    assert edits == [
+        {'segment': 1, 'before': 'hello', 'after': 'hi'},
+        {'segment': 2, 'before': 'world', 'after': 'there'},
+    ]

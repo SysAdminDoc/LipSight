@@ -79,7 +79,7 @@ except Exception:
 import requests
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
-from PyQt6.QtGui import QIcon, QImage, QPixmap
+from PyQt6.QtGui import QBrush, QColor, QIcon, QImage, QPainter, QPen, QPixmap
 
 APP_NAME = "LipSight"
 APP_VERSION = "1.1.0"
@@ -271,6 +271,41 @@ def normalize_result(result, segment_number=None):
 
 def normalize_results(results):
     return [normalize_result(result, i) for i, result in enumerate(results or [], 1)]
+
+
+def apply_review_text(results, edited_text):
+    """Apply reviewed transcript text while retaining segment timing metadata."""
+    normalized = normalize_results(results)
+    if not normalized:
+        return [], []
+    edited_text = str(edited_text or '').strip()
+    lines = [line.strip() for line in edited_text.splitlines() if line.strip()]
+    if len(lines) == len(normalized):
+        replacements = lines
+    elif len(normalized) == 1:
+        replacements = [edited_text]
+    else:
+        words = edited_text.split()
+        weights = [max(1, len(result['text'].split())) for result in normalized]
+        total_weight = sum(weights)
+        replacements = []
+        cursor = 0
+        for index, weight in enumerate(weights):
+            if index == len(weights) - 1:
+                stop = len(words)
+            else:
+                stop = cursor + max(0, round(len(words) * weight / total_weight))
+            replacements.append(' '.join(words[cursor:stop]))
+            cursor = stop
+
+    edits = []
+    updated = []
+    for result, replacement in zip(normalized, replacements):
+        replacement = replacement.strip()
+        if replacement != result['text']:
+            edits.append({'segment': result['segment'], 'before': result['text'], 'after': replacement})
+        updated.append({**result, 'text': replacement})
+    return updated, edits
 
 
 def normalize_segments(segments):
@@ -1118,6 +1153,32 @@ def export_segments(video_path, results, output_dir):
     return exported
 
 
+def burn_in_subtitles(video_path, results, output_path):
+    """Render SRT captions into a video through ffmpeg."""
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        raise RuntimeError('ffmpeg is required for burn-in subtitles')
+    source = Path(video_path).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f'video not found: {source}')
+    output = _safe_output_path(output_path)
+    subtitle_path = output.with_name(f'.{output.stem}.{uuid.uuid4().hex}.srt')
+    try:
+        export_srt(results, subtitle_path)
+        escaped = subtitle_path.as_posix().replace(':', r'\:').replace("'", r"\'")
+        filter_arg = f"subtitles=filename='{escaped}'"
+        completed = subprocess.run(
+            [ffmpeg, '-y', '-i', str(source), '-vf', filter_arg, '-c:v', 'libx264', '-c:a', 'aac', str(output)],
+            capture_output=True, text=True, timeout=300)
+        if completed.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
+            detail = (completed.stderr or completed.stdout or 'ffmpeg failed').strip().splitlines()[-1]
+            raise RuntimeError(detail)
+        return output
+    finally:
+        if subtitle_path.exists():
+            subtitle_path.unlink()
+
+
 # ── Headless processing ────────────────────────────────────────────────────
 def video_duration(video_path):
     cap = cv2.VideoCapture(str(video_path))
@@ -1316,15 +1377,24 @@ class ProcessingWorker(QThread):
 
 class SegmentWorker(QThread):
     progress = pyqtSignal(int); log = pyqtSignal(str)
+    curve = pyqtSignal(list)
     finished = pyqtSignal(list); error = pyqtSignal(str)
-    def __init__(self, vp): super().__init__(); self.vp = vp
+    def __init__(self, vp, threshold=0.06, multi_speaker=False):
+        super().__init__()
+        self.vp = vp
+        self.threshold = threshold
+        self.multi_speaker = multi_speaker
     def run(self):
-        try: self.finished.emit(VideoSegmenter().segment(self.vp, self.progress.emit, self.log.emit))
+        try:
+            segmenter = VideoSegmenter(self.threshold)
+            segments = segmenter.segment(self.vp, self.progress.emit, self.log.emit, self.multi_speaker)
+            self.curve.emit(segmenter.last_curve)
+            self.finished.emit(segments)
         except Exception as e: self.error.emit(str(e))
 
 
 class FrameWorker(QThread):
-    frame_ready = pyqtSignal(QImage, float, dict); finished = pyqtSignal()
+    frame_ready = pyqtSignal(QImage, float, dict, QImage); finished = pyqtSignal()
     def __init__(self, vp, n): super().__init__(); self.vp, self.n = vp, n
     def run(self):
         try:
@@ -1334,20 +1404,129 @@ class FrameWorker(QThread):
             cap.set(cv2.CAP_PROP_POS_FRAMES, self.n)
             ok, frame = cap.read(); cap.release()
             if not ok or frame is None: self.finished.emit(); return
+            roi_image = QImage()
+            roi = None
+            ratio = 0.0
+            details = {}
             try:
                 a = FaceAnalyzer()
-                out, roi, ratio, _ = a.analyze_frame(frame) if a.available else (frame, None, 0.0, None)
+                out, roi, ratio, details = a.analyze_frame(frame) if a.available else (frame, None, 0.0, {})
                 a.close()
-            except: out, ratio = frame, 0.0
+                if roi:
+                    first_face = ((details or {}).get('faces') or [{}])[0]
+                    preprocessor = MouthPreprocessor(output_size=(160, 120), stabilize=False)
+                    mouth = preprocessor.process(frame, roi=roi, points=first_face.get('points'))
+                    mouth_rgb = np.ascontiguousarray(cv2.cvtColor(mouth, cv2.COLOR_BGR2RGB))
+                    mh, mw, mch = mouth_rgb.shape
+                    roi_image = QImage(mouth_rgb.data, mw, mh, mch*mw, QImage.Format.Format_RGB888).copy()
+            except: out, ratio, details = frame, 0.0, {}
             rgb = np.ascontiguousarray(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
             h, w, ch = rgb.shape
             img = QImage(rgb.data, w, h, ch*w, QImage.Format.Format_RGB888).copy()
-            self.frame_ready.emit(img, self.n/fps, {'open_ratio': ratio})
+            info = {'open_ratio': ratio, 'face_count': len((details or {}).get('faces', []))}
+            self.frame_ready.emit(img, self.n/fps, info, roi_image)
         except: pass
         self.finished.emit()
 
 
 # ── Widgets ─────────────────────────────────────────────────────────────────
+class MouthCurveWidget(QWidget):
+    """Pointer-editable mouth-motion curve with draggable segment handles."""
+
+    segments_changed = pyqtSignal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(96)
+        self.setMouseTracking(True)
+        self.curve = []
+        self.segment_data = []
+        self._drag = None
+
+    def set_data(self, curve=None, segments=None):
+        self.curve = [(float(time_value), float(ratio)) for time_value, ratio in (curve or [])]
+        self.segment_data = normalize_segments(segments)
+        self.update()
+
+    def segments(self):
+        return [dict(segment) for segment in self.segment_data]
+
+    def _duration(self):
+        values = [item[0] for item in self.curve]
+        values.extend(segment['end'] for segment in self.segment_data)
+        return max(max(values or [1.0]), 1.0)
+
+    def _plot_rect(self):
+        return (10, 10, max(1, self.width() - 20), max(1, self.height() - 28))
+
+    def _x(self, time_value):
+        left, _top, width, _height = self._plot_rect()
+        return left + (time_value / self._duration()) * width
+
+    def _time(self, x_value):
+        left, _top, width, _height = self._plot_rect()
+        return max(0.0, min(self._duration(), (x_value - left) / max(width, 1) * self._duration()))
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor(C['crust']))
+        left, top, width, height = self._plot_rect()
+        painter.setPen(QPen(QColor(C['surface1']), 1))
+        painter.drawRect(left, top, width, height)
+
+        for segment in self.segment_data:
+            start_x = int(self._x(segment['start']))
+            end_x = int(self._x(segment['end']))
+            color = C['mauve'] if segment.get('speaker') == 'B' else C['blue']
+            painter.fillRect(start_x, top, max(2, end_x - start_x), height, QColor(color + '22'))
+            painter.setPen(QPen(QColor(color), 1))
+            painter.drawLine(start_x, top, start_x, top + height)
+            painter.drawLine(end_x, top, end_x, top + height)
+
+        if self.curve:
+            painter.setPen(QPen(QColor(C['green']), 2))
+            previous = None
+            for time_value, ratio in self.curve:
+                point = QPointF(self._x(time_value), top + height - min(1.0, max(0.0, ratio) / 0.3) * height)
+                if previous is not None:
+                    painter.drawLine(previous, point)
+                previous = point
+        painter.setPen(QPen(QColor(C['overlay1']), 1))
+        painter.drawText(left, self.height() - 6, f'0:00   Mouth movement   {LipSightWindow._ft(self._duration())}')
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton or not self.segment_data:
+            return
+        x_value = event.position().x()
+        nearest = None
+        distance = 13
+        for index, segment in enumerate(self.segment_data):
+            for side in ('start', 'end'):
+                candidate = abs(self._x(segment[side]) - x_value)
+                if candidate < distance:
+                    nearest = (index, side)
+                    distance = candidate
+        self._drag = nearest
+
+    def mouseMoveEvent(self, event):
+        if self._drag is None:
+            return
+        index, side = self._drag
+        value = self._time(event.position().x())
+        segment = self.segment_data[index]
+        if side == 'start':
+            segment['start'] = min(value, segment['end'] - 0.05)
+        else:
+            segment['end'] = max(value, segment['start'] + 0.05)
+        self.update()
+        self.segments_changed.emit(self.segments())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag = None
+
+
 class VideoPreview(QLabel):
     def __init__(self):
         super().__init__(); self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1380,6 +1559,7 @@ class LipSightWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}"); self.resize(1300,840); self.setMinimumSize(1000,650)
         self.cfg = load_config()
         self.video_path = None; self.video_info = {}; self.segments = []; self.results = []
+        self.review_edits = []; self._curve_data = []
         self._fw = self._sw = self._pw = None
         self._build(); self._connect()
         fa = FaceAnalyzer()
@@ -1407,7 +1587,13 @@ class LipSightWindow(QMainWindow):
 
         # Left
         left = QWidget(); ll = QVBoxLayout(left); ll.setContentsMargins(0,0,0,0); ll.setSpacing(8)
-        self.preview = VideoPreview(); ll.addWidget(self.preview, stretch=1)
+        views = QHBoxLayout(); views.setSpacing(8)
+        self.preview = VideoPreview(); self.preview.setText("📹  Load a video to begin")
+        self.preview.setToolTip("Annotated video preview")
+        self.roi_preview = VideoPreview(); self.roi_preview.setText("👄  Mouth ROI")
+        self.roi_preview.setToolTip("Aligned, normalized mouth crop")
+        views.addWidget(self.preview, stretch=3); views.addWidget(self.roi_preview, stretch=2)
+        ll.addLayout(views, stretch=1)
 
         sr = QHBoxLayout()
         self.t_lbl = QLabel("00:00.000"); self.t_lbl.setStyleSheet(f"color:{C['overlay1']};font-family:monospace;font-size:12px;")
@@ -1416,6 +1602,8 @@ class LipSightWindow(QMainWindow):
         sr.addWidget(self.slider, stretch=1)
         self.d_lbl = QLabel("00:00.000"); self.d_lbl.setStyleSheet(f"color:{C['overlay1']};font-family:monospace;font-size:12px;")
         sr.addWidget(self.d_lbl); ll.addLayout(sr)
+        self.curve = MouthCurveWidget(); self.curve.setToolTip("Mouth movement curve — drag segment edges to review timing")
+        ll.addWidget(self.curve)
 
         br = QHBoxLayout(); br.setSpacing(8)
         self.b_load = QPushButton("📂  Load Video"); br.addWidget(self.b_load)
@@ -1437,22 +1625,27 @@ class LipSightWindow(QMainWindow):
 
         # Results
         rw = QWidget(); rl = QVBoxLayout(rw); rl.setContentsMargins(8,8,8,8)
-        self.tbl = QTableWidget(); self.tbl.setColumnCount(3)
-        self.tbl.setHorizontalHeaderLabels(["Time","Dur","Transcription"])
+        self.tbl = QTableWidget(); self.tbl.setColumnCount(5)
+        self.tbl.setHorizontalHeaderLabels(["Time","Dur","Speaker","Conf.","Transcription"])
         self.tbl.horizontalHeader().setStretchLastSection(True)
         self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.tbl.setAlternatingRowColors(True); self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); self.tbl.verticalHeader().setVisible(False)
         rl.addWidget(self.tbl)
-        self.txte = QTextEdit(); self.txte.setReadOnly(True); self.txte.setMaximumHeight(120)
-        self.txte.setPlaceholderText("Full transcript..."); rl.addWidget(self.txte)
+        self.txte = QTextEdit(); self.txte.setReadOnly(False); self.txte.setMaximumHeight(120)
+        self.txte.setPlaceholderText("Full transcript — edit here, then Apply Review..."); rl.addWidget(self.txte)
         er = QHBoxLayout()
         self.bsrt=QPushButton("💾 SRT"); self.bsrt.setObjectName("secondaryBtn"); self.bsrt.setEnabled(False)
+        self.bvtt=QPushButton("💾 VTT"); self.bvtt.setObjectName("secondaryBtn"); self.bvtt.setEnabled(False)
         self.btxt=QPushButton("📄 TXT"); self.btxt.setObjectName("secondaryBtn"); self.btxt.setEnabled(False)
         self.bjsn=QPushButton("{ } JSON"); self.bjsn.setObjectName("secondaryBtn"); self.bjsn.setEnabled(False)
         self.bcpy=QPushButton("📋 Copy"); self.bcpy.setObjectName("secondaryBtn"); self.bcpy.setEnabled(False)
-        for b in [self.bsrt,self.btxt,self.bjsn,self.bcpy]: er.addWidget(b)
+        self.breview=QPushButton("✎ Apply Review"); self.breview.setObjectName("accentBtn"); self.breview.setEnabled(False)
+        self.bproject=QPushButton("📦 Project"); self.bproject.setObjectName("secondaryBtn"); self.bproject.setEnabled(False)
+        for b in [self.bsrt,self.bvtt,self.btxt,self.bjsn,self.bcpy,self.breview,self.bproject]: er.addWidget(b)
         rl.addLayout(er); tabs.addTab(rw, "📝 Results")
 
         # Log
@@ -1507,6 +1700,7 @@ class LipSightWindow(QMainWindow):
 
         sg = QGroupBox("Segmentation"); sgl = QVBoxLayout(sg)
         self.chk_seg = QCheckBox("Auto-segment by mouth movement"); self.chk_seg.setChecked(self.cfg.get('auto_segment',True)); sgl.addWidget(self.chk_seg)
+        self.chk_multi = QCheckBox("Label multiple speakers (A, B, ...)"); self.chk_multi.setChecked(self.cfg.get('multi_speaker', False)); sgl.addWidget(self.chk_multi)
         sl.addWidget(sg)
 
         self.b_save = QPushButton("💾  Save Settings"); sl.addWidget(self.b_save); sl.addStretch()
@@ -1527,7 +1721,9 @@ class LipSightWindow(QMainWindow):
         self.b_process.clicked.connect(self._process); self.b_cancel.clicked.connect(self._cancel)
         self.b_save.clicked.connect(self._save); self.slider.valueChanged.connect(self._scrub)
         self.bsrt.clicked.connect(lambda: self._export('srt')); self.btxt.clicked.connect(lambda: self._export('txt'))
-        self.bjsn.clicked.connect(lambda: self._export('json')); self.bcpy.clicked.connect(self._copy)
+        self.bvtt.clicked.connect(lambda: self._export('vtt')); self.bjsn.clicked.connect(lambda: self._export('json'))
+        self.bcpy.clicked.connect(self._copy); self.breview.clicked.connect(self._apply_review)
+        self.bproject.clicked.connect(self._save_project); self.curve.segments_changed.connect(self._segments_changed)
 
     def _on_be(self, i): self.stack.setCurrentIndex(i); self.badge.setText(BACKENDS[i])
 
@@ -1535,7 +1731,8 @@ class LipSightWindow(QMainWindow):
         p, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Video (*.mp4 *.mov *.avi *.mkv *.webm);;All (*)")
         if not p: return
         try:
-            self.video_path = p; self.results = []; self.segments = []; self.tbl.setRowCount(0); self.txte.clear(); self._exp(False)
+            self.video_path = p; self.results = []; self.segments = []; self.review_edits = []; self._curve_data = []
+            self.tbl.setRowCount(0); self.txte.clear(); self.curve.set_data(); self.roi_preview.clear(); self._exp(False)
             cap = cv2.VideoCapture(p)
             if not cap.isOpened(): self._log("❌ Can't open"); return
             fps = cap.get(cv2.CAP_PROP_FPS) or 25.0; frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1555,8 +1752,10 @@ class LipSightWindow(QMainWindow):
         self._fw = FrameWorker(self.video_path, n)
         self._fw.frame_ready.connect(self._of); self._fw.start()
 
-    def _of(self, img, ts, info):
-        self.preview.set_frame(img); self.t_lbl.setText(self._ft(ts))
+    def _of(self, img, ts, info, roi_img):
+        self.preview.set_frame(img)
+        if not roi_img.isNull(): self.roi_preview.set_frame(roi_img)
+        self.t_lbl.setText(self._ft(ts))
         self._sv(self.smo, f"{info.get('open_ratio',0):.2f}")
 
     def _scrub(self, v): self._lf(v)
@@ -1564,17 +1763,27 @@ class LipSightWindow(QMainWindow):
     def _analyze(self):
         if not self.video_path: return
         self.b_analyze.setEnabled(False); self.b_process.setEnabled(False); self.prog.setValue(0)
-        self._log("🔍 Analyzing..."); self._sw = SegmentWorker(self.video_path)
+        self._log("🔍 Analyzing...")
+        self._curve_data = []
+        self._sw = SegmentWorker(
+            self.video_path,
+            threshold=float(self.cfg.get('mouth_threshold', 0.06)),
+            multi_speaker=self.chk_multi.isChecked(),
+        )
         self._sw.progress.connect(self.prog.setValue); self._sw.log.connect(self._log)
+        self._sw.curve.connect(self._oc)
         self._sw.finished.connect(self._os)
         self._sw.error.connect(lambda m: (self._log(f"❌ {m}"), self.b_analyze.setEnabled(True), self.b_process.setEnabled(True)))
         self._sw.start()
 
     def _os(self, segs):
-        self.segments = segs; self._sv(self.sseg, len(segs))
+        self.segments = normalize_segments(segs); self._sv(self.sseg, len(self.segments))
+        self.curve.set_data(self._curve_data, self.segments)
         self.b_analyze.setEnabled(True); self.b_process.setEnabled(True); self.prog.setValue(100)
-        for i,(s,e) in enumerate(segs): self._log(f"   [{i+1}] {self._ft(s)} → {self._ft(e)} ({e-s:.1f}s)")
-        Toast(self, f"  ✅  {len(segs)} segments  ", C['green'])
+        for i, segment in enumerate(self.segments):
+            speaker = f" {segment['speaker']}" if segment.get('speaker') else ''
+            self._log(f"   [{i+1}{speaker}] {self._ft(segment['start'])} → {self._ft(segment['end'])} ({segment['end']-segment['start']:.1f}s)")
+        Toast(self, f"  ✅  {len(self.segments)} segments  ", C['green'])
 
     def _process(self):
         if not self.video_path: return
@@ -1609,11 +1818,17 @@ class LipSightWindow(QMainWindow):
         row = self.tbl.rowCount(); self.tbl.insertRow(row)
         self.tbl.setItem(row,0,QTableWidgetItem(f"{self._ft(r['start'])} → {self._ft(r['end'])}"))
         self.tbl.setItem(row,1,QTableWidgetItem(f"{r['end']-r['start']:.1f}s"))
-        self.tbl.setItem(row,2,QTableWidgetItem(r['text'])); self.tbl.scrollToBottom()
+        self.tbl.setItem(row,2,QTableWidgetItem(r.get('speaker','A')))
+        confidence = r.get('confidence')
+        confidence_item = QTableWidgetItem(f"{confidence:.0%}" if confidence is not None else "—")
+        if confidence is not None:
+            confidence_item.setForeground(QColor(C['green'] if confidence >= 0.75 else C['peach'] if confidence >= 0.5 else C['red']))
+        self.tbl.setItem(row,3,confidence_item)
+        self.tbl.setItem(row,4,QTableWidgetItem(r['text'])); self.tbl.scrollToBottom()
 
     def _od(self, res):
         self.results = res; self.b_process.setEnabled(True); self.b_analyze.setEnabled(True); self.b_cancel.setEnabled(False); self._exp(True)
-        full = ' '.join(r['text'] for r in res if r['text']); self.txte.setPlainText(full)
+        full = '\n'.join(r['text'] for r in res if r['text']); self.txte.setPlainText(full)
         self.statusBar().showMessage(f"Done — {len(res)} seg(s), {len(full.split())} words")
         Toast(self, f"  ✅  {len(res)} segments transcribed  ", C['green'])
 
@@ -1625,10 +1840,10 @@ class LipSightWindow(QMainWindow):
         if not self.results: return
         base = Path(self.video_path).stem if self.video_path else "lipsight"
         p, _ = QFileDialog.getSaveFileName(self, f"Export", f"{base}_lipsight.{fmt}",
-            {"srt":"SRT (*.srt)","txt":"Text (*.txt)","json":"JSON (*.json)"}.get(fmt,"*"))
+            {"srt":"SRT (*.srt)","vtt":"WebVTT (*.vtt)","txt":"Text (*.txt)","json":"JSON (*.json)"}.get(fmt,"*"))
         if not p: return
         try:
-            {'srt':export_srt,'txt':export_txt,'json':export_json}[fmt](self.results, p)
+            export_results(self.results, p, fmt=fmt, metadata={'video_path': self.video_path})
             self._log(f"💾 {p}"); Toast(self, "  💾  Exported  ", C['green'])
         except Exception as e: self._log(f"❌ {e}"); Toast(self, "  ❌  Failed  ", C['red'])
 
@@ -1637,7 +1852,7 @@ class LipSightWindow(QMainWindow):
         if t: QApplication.clipboard().setText(t); Toast(self, "  📋  Copied  ", C['green'])
 
     def _exp(self, on):
-        for b in [self.bsrt, self.btxt, self.bjsn, self.bcpy]: b.setEnabled(on)
+        for b in [self.bsrt, self.bvtt, self.btxt, self.bjsn, self.bcpy, self.breview, self.bproject]: b.setEnabled(on)
 
     def _save(self):
         self.cfg.update({
@@ -1647,8 +1862,43 @@ class LipSightWindow(QMainWindow):
             'custom_endpoint': self.ep_url.text().strip(),
             'custom_endpoint_key': self.ep_key.text().strip(),
             'auto_segment': self.chk_seg.isChecked(),
+            'multi_speaker': self.chk_multi.isChecked(),
         })
         save_config(self.cfg); Toast(self, "  ✅  Saved  ", C['green']); self._log("💾 Settings saved")
+
+    def _oc(self, curve):
+        self._curve_data = curve
+
+    def _segments_changed(self, segments):
+        self.segments = normalize_segments(segments)
+        self._sv(self.sseg, len(self.segments))
+
+    def _apply_review(self):
+        if not self.results:
+            return
+        self.results, edits = apply_review_text(self.results, self.txte.toPlainText())
+        self.review_edits.extend(edits)
+        self.tbl.setRowCount(0)
+        for result in self.results:
+            self._or(result)
+        self.txte.setPlainText('\n'.join(result['text'] for result in self.results if result['text']))
+        self._log(f"✎ Applied {len(edits)} review edit(s)")
+        Toast(self, f"  ✅  Review applied  ", C['green'])
+
+    def _save_project(self):
+        if not self.video_path:
+            return
+        base = Path(self.video_path).stem
+        path, _ = QFileDialog.getSaveFileName(self, "Save LipSight Project", f"{base}.lipsight", "LipSight Project (*.lipsight)")
+        if not path:
+            return
+        try:
+            saved = save_project(path, self.video_path, self.segments, self.results, self.review_edits, metadata={'backend': BACKENDS[self.be_combo.currentIndex()]})
+            self._log(f"📦 {saved}")
+            Toast(self, "  ✅  Project saved  ", C['green'])
+        except Exception as exc:
+            self._log(f"❌ {exc}")
+            Toast(self, "  ❌  Project failed  ", C['red'])
 
     def _pre_dl(self):
         self._log("📥 Pre-downloading local model..."); self.b_dl.setEnabled(False); self.b_dl.setText("⏳ Downloading...")
