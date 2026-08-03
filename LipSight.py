@@ -6,8 +6,11 @@ Supports: Local PyTorch inference (FREE), HuggingFace Spaces (FREE), Replicate A
 """
 
 import sys, os, subprocess, json, time, tempfile, threading, math, hashlib, random, shutil
+import argparse
+import uuid
+import zipfile
 from pathlib import Path
-from datetime import timedelta
+from datetime import datetime, timezone, timedelta
 
 
 # codex-branding:start
@@ -80,6 +83,10 @@ from PyQt6.QtGui import QIcon, QImage, QPixmap
 
 APP_NAME = "LipSight"
 APP_VERSION = "1.1.0"
+RESULT_SCHEMA_VERSION = "1.0"
+PROJECT_SCHEMA_VERSION = "1.0"
+PROJECT_MANIFEST = "project.json"
+VIDEO_EXTENSIONS = {'.avi', '.mkv', '.mov', '.mp4', '.webm'}
 
 # ── Catppuccin Mocha ────────────────────────────────────────────────────────
 C = {
@@ -190,6 +197,239 @@ def load_config():
 
 def save_config(cfg):
     with open(os.path.join(get_config_dir(), 'config.json'), 'w') as f: json.dump(cfg, f, indent=2)
+
+
+# ── Stable data contracts ──────────────────────────────────────────────────
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def _timestamp_value(value, field, default=None):
+    if value is None and default is not None:
+        value = default
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{field} must be a number') from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f'{field} must be a finite, non-negative number')
+    return value
+
+
+def _confidence_value(value):
+    if value is None or value == '':
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('confidence must be a number or null') from exc
+    if not math.isfinite(value):
+        raise ValueError('confidence must be finite')
+    return max(0.0, min(1.0, value))
+
+
+def normalize_result(result, segment_number=None):
+    """Return one transcription result in the versioned export shape."""
+    if not isinstance(result, dict):
+        raise TypeError('result must be a dictionary')
+
+    start = _timestamp_value(result.get('start', 0.0), 'start')
+    end = _timestamp_value(result.get('end', start), 'end')
+    if end < start:
+        raise ValueError('end must be greater than or equal to start')
+
+    words = []
+    for raw_word in result.get('words') or []:
+        word = {'text': str(raw_word)} if isinstance(raw_word, str) else dict(raw_word)
+        word_start = _timestamp_value(word.get('start', start), 'word.start')
+        word_end = _timestamp_value(word.get('end', word_start), 'word.end')
+        if word_end < word_start:
+            raise ValueError('word.end must be greater than or equal to word.start')
+        words.append({
+            'text': str(word.get('text', '')).strip(),
+            'start': word_start,
+            'end': word_end,
+            'confidence': _confidence_value(word.get('confidence')),
+        })
+
+    raw_segment = result.get('segment', segment_number or 1)
+    try:
+        raw_segment = int(raw_segment)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('segment must be an integer') from exc
+
+    return {
+        'speaker': str(result.get('speaker') or 'A'),
+        'start': start,
+        'end': end,
+        'text': str(result.get('text', '')).strip(),
+        'confidence': _confidence_value(result.get('confidence')),
+        'words': words,
+        'segment': max(1, raw_segment),
+    }
+
+
+def normalize_results(results):
+    return [normalize_result(result, i) for i, result in enumerate(results or [], 1)]
+
+
+def normalize_segments(segments):
+    normalized = []
+    for raw_segment in segments or []:
+        if isinstance(raw_segment, dict):
+            start = raw_segment.get('start', 0.0)
+            end = raw_segment.get('end', start)
+        else:
+            try:
+                start, end = raw_segment
+            except (TypeError, ValueError) as exc:
+                raise ValueError('segments must contain start/end pairs') from exc
+        start = _timestamp_value(start, 'segment.start')
+        end = _timestamp_value(end, 'segment.end')
+        if end < start:
+            raise ValueError('segment.end must be greater than or equal to segment.start')
+        normalized.append({'start': start, 'end': end})
+    return normalized
+
+
+def build_result_document(results, metadata=None):
+    """Build the stable JSON document shared by GUI, CLI, and project exports."""
+    return {
+        'schema_version': RESULT_SCHEMA_VERSION,
+        'app_name': APP_NAME,
+        'app_version': APP_VERSION,
+        'generated_at': _utc_now(),
+        'metadata': dict(metadata or {}),
+        'results': normalize_results(results),
+    }
+
+
+def _safe_output_path(path):
+    output = Path(path).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return output
+
+
+def _project_member_path(root, member):
+    root = Path(root).resolve()
+    target = (root / Path(member).name).resolve()
+    if os.path.commonpath([str(root), str(target)]) != str(root):
+        raise ValueError('project member escapes extraction directory')
+    return target
+
+
+def save_project(project_path, video_path=None, segments=None, results=None, edits=None,
+                 include_video=False, metadata=None):
+    """Save segmentation, transcription, edits, and video reference in a .lipsight zip."""
+    project_path = _safe_output_path(project_path)
+    if project_path.suffix.lower() != '.lipsight':
+        project_path = project_path.with_suffix('.lipsight')
+
+    video = None
+    if video_path:
+        source = Path(video_path).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f'video not found: {source}')
+        member = f'media/{source.name}' if include_video else None
+        video = {'path': str(source), 'embedded': bool(member), 'member': member}
+
+    manifest = {
+        'schema_version': PROJECT_SCHEMA_VERSION,
+        'app_name': APP_NAME,
+        'app_version': APP_VERSION,
+        'created_at': _utc_now(),
+        'video': video,
+        'segments': normalize_segments(segments),
+        'results': normalize_results(results),
+        'edits': edits if edits is not None else [],
+        'metadata': dict(metadata or {}),
+    }
+
+    temp_path = project_path.with_name(f'.{project_path.name}.{uuid.uuid4().hex}.tmp')
+    try:
+        with zipfile.ZipFile(temp_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(PROJECT_MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=2))
+            if video and video['embedded']:
+                archive.write(video_path, video['member'])
+        os.replace(temp_path, project_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return project_path
+
+
+def load_project(project_path, extract_dir=None):
+    """Load and validate a .lipsight project, extracting embedded media safely."""
+    project_path = Path(project_path).expanduser().resolve()
+    with zipfile.ZipFile(project_path, 'r') as archive:
+        try:
+            manifest = json.loads(archive.read(PROJECT_MANIFEST).decode('utf-8'))
+        except KeyError as exc:
+            raise ValueError('project is missing project.json') from exc
+        if manifest.get('schema_version') != PROJECT_SCHEMA_VERSION:
+            raise ValueError(f"unsupported project schema: {manifest.get('schema_version')}")
+        manifest['segments'] = normalize_segments(manifest.get('segments'))
+        manifest['results'] = normalize_results(manifest.get('results'))
+
+        video = manifest.get('video')
+        if video and video.get('embedded'):
+            member = video.get('member')
+            if not member or member not in archive.namelist():
+                raise ValueError('embedded video is missing from project')
+            target_root = Path(extract_dir or project_path.with_suffix('.media'))
+            target_root.mkdir(parents=True, exist_ok=True)
+            target = _project_member_path(target_root, member)
+            with archive.open(member) as source, open(target, 'wb') as destination:
+                shutil.copyfileobj(source, destination)
+            video['path'] = str(target)
+        return manifest
+
+
+class SessionArchive:
+    """Append-only local transcript archive with lightweight full-text search."""
+
+    def __init__(self, path=None):
+        self.path = Path(path or os.path.join(get_config_dir(), 'sessions.jsonl')).expanduser()
+
+    def record(self, video_path, results, backend='', metadata=None):
+        entry = {
+            'id': uuid.uuid4().hex,
+            'created_at': _utc_now(),
+            'video_path': str(Path(video_path).expanduser()) if video_path else None,
+            'backend': str(backend or ''),
+            'results': normalize_results(results),
+            'metadata': dict(metadata or {}),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open('a', encoding='utf-8') as archive:
+            archive.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        return entry
+
+    def entries(self, limit=None):
+        if not self.path.is_file():
+            return []
+        entries = []
+        with self.path.open('r', encoding='utf-8') as archive:
+            for line in archive:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        entries.reverse()
+        return entries[:limit] if limit else entries
+
+    def search(self, query, limit=100):
+        needle = str(query or '').casefold().strip()
+        if not needle:
+            return self.entries(limit)
+        matches = []
+        for entry in self.entries():
+            haystack = json.dumps(entry, ensure_ascii=False).casefold()
+            if needle in haystack:
+                matches.append(entry)
+                if len(matches) >= limit:
+                    break
+        return matches
 
 
 # ── Face Detection ──────────────────────────────────────────────────────────
@@ -581,19 +821,278 @@ class DirectAPIBackend:
 
 # ── Export ──────────────────────────────────────────────────────────────────
 def _ts(s):
-    h=int(s)//3600; m=(int(s)%3600)//60; sec=s-h*3600-m*60
-    return f"{h:02d}:{m:02d}:{sec:06.3f}".replace('.',',')
+    milliseconds = int(round(_timestamp_value(s, 'timestamp') * 1000))
+    hours, milliseconds = divmod(milliseconds, 3_600_000)
+    minutes, milliseconds = divmod(milliseconds, 60_000)
+    seconds, milliseconds = divmod(milliseconds, 1_000)
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}'
+
+
+def _vtt_ts(s):
+    return _ts(s).replace(',', '.')
 
 def export_srt(res, fp):
-    with open(fp,'w',encoding='utf-8') as f:
-        for i,r in enumerate(res,1): f.write(f"{i}\n{_ts(r['start'])} --> {_ts(r['end'])}\n{r['text']}\n\n")
+    normalized = normalize_results(res)
+    with open(_safe_output_path(fp), 'w', encoding='utf-8', newline='\n') as f:
+        for i, result in enumerate(normalized, 1):
+            f.write(f"{i}\n{_ts(result['start'])} --> {_ts(result['end'])}\n{result['text']}\n\n")
+
+
+def export_vtt(res, fp):
+    normalized = normalize_results(res)
+    with open(_safe_output_path(fp), 'w', encoding='utf-8', newline='\n') as f:
+        f.write('WEBVTT\n\n')
+        for i, result in enumerate(normalized, 1):
+            f.write(f"{i}\n{_vtt_ts(result['start'])} --> {_vtt_ts(result['end'])}\n{result['text']}\n\n")
 
 def export_txt(res, fp):
-    with open(fp,'w',encoding='utf-8') as f:
-        for r in res: f.write(f"[{_ts(r['start'])} -> {_ts(r['end'])}] {r['text']}\n")
+    normalized = normalize_results(res)
+    with open(_safe_output_path(fp), 'w', encoding='utf-8', newline='\n') as f:
+        for result in normalized:
+            speaker = f"{result['speaker']}: " if result['speaker'] else ''
+            f.write(f"[{_ts(result['start'])} -> {_ts(result['end'])}] {speaker}{result['text']}\n")
 
-def export_json(res, fp):
-    with open(fp,'w',encoding='utf-8') as f: json.dump({'results':res,'version':APP_VERSION},f,indent=2)
+def export_json(res, fp, metadata=None):
+    with open(_safe_output_path(fp), 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(build_result_document(res, metadata), f, ensure_ascii=False, indent=2)
+        f.write('\n')
+
+
+def export_results(res, fp, fmt=None, metadata=None):
+    output = Path(fp)
+    format_name = (fmt or output.suffix.lstrip('.')).lower()
+    exporters = {'srt': export_srt, 'vtt': export_vtt, 'txt': export_txt, 'json': export_json}
+    if format_name not in exporters:
+        raise ValueError(f'unsupported export format: {format_name or "none"}')
+    if format_name == 'json':
+        exporters[format_name](res, output, metadata=metadata)
+    else:
+        exporters[format_name](res, output)
+    return output
+
+
+def extract_video_segment(video_path, start, end, output_path):
+    """Extract a silent video segment with ffmpeg, falling back to OpenCV."""
+    source = Path(video_path).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f'video not found: {source}')
+    start = _timestamp_value(start, 'start')
+    end = _timestamp_value(end, 'end')
+    if end <= start:
+        raise ValueError('segment end must be greater than start')
+    output = _safe_output_path(output_path)
+
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg:
+        completed = subprocess.run(
+            [ffmpeg, '-y', '-ss', str(start), '-i', str(source), '-t', str(end - start),
+             '-map', '0:v:0', '-an', '-c:v', 'libx264', '-preset', 'ultrafast', str(output)],
+            capture_output=True, text=True, timeout=120)
+        if completed.returncode == 0 and output.is_file() and output.stat().st_size > 0:
+            return output
+
+    cap = cv2.VideoCapture(str(source))
+    if not cap.isOpened():
+        raise RuntimeError(f'cannot open video: {source}')
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f'cannot create segment: {output}')
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(start * fps))
+        for _ in range(max(1, int((end - start) * fps))):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            writer.write(frame)
+    finally:
+        writer.release()
+        cap.release()
+    if not output.is_file() or output.stat().st_size == 0:
+        raise RuntimeError(f'could not extract segment: {output}')
+    return output
+
+
+def export_segments(video_path, results, output_dir):
+    output_dir = Path(output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(video_path).stem
+    exported = []
+    for index, result in enumerate(normalize_results(results), 1):
+        output = output_dir / f'{stem}_segment_{index:03d}.mp4'
+        exported.append(extract_video_segment(video_path, result['start'], result['end'], output))
+    return exported
+
+
+# ── Headless processing ────────────────────────────────────────────────────
+def video_duration(video_path):
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f'cannot open video: {video_path}')
+    try:
+        return cap.get(cv2.CAP_PROP_FRAME_COUNT) / (cap.get(cv2.CAP_PROP_FPS) or 25.0)
+    finally:
+        cap.release()
+
+
+def _transcription_payload(value):
+    if isinstance(value, dict):
+        return {
+            'text': str(value.get('text', value.get('transcription', ''))).strip(),
+            'confidence': value.get('confidence'),
+            'words': value.get('words') or [],
+            'speaker': value.get('speaker') or 'A',
+        }
+    if isinstance(value, list):
+        return {'text': ' '.join(str(item) for item in value).strip(), 'confidence': None, 'words': [], 'speaker': 'A'}
+    return {'text': str(value or '').strip(), 'confidence': None, 'words': [], 'speaker': 'A'}
+
+
+def _transcribe_batch(backend, paths, log_cb=None):
+    batch = getattr(backend, 'transcribe_batch', None)
+    if not callable(batch):
+        return None
+    values = batch(paths, log_cb=log_cb)
+    if not isinstance(values, list) or len(values) != len(paths):
+        raise RuntimeError('batch backend returned an unexpected number of results')
+    return values
+
+
+def process_video(video_path, backend, segments=None, progress_cb=None, log_cb=None,
+                  segment_cb=None, should_stop=None):
+    """Process a video without Qt so CLI, watch mode, and workers share one path."""
+    progress_cb = progress_cb or (lambda _value: None)
+    log_cb = log_cb or (lambda _message: None)
+    segment_cb = segment_cb or (lambda _result: None)
+    should_stop = should_stop or (lambda: False)
+    normalized_segments = normalize_segments(segments)
+    results = []
+
+    if not normalized_segments or len(normalized_segments) == 1:
+        log_cb('🎬 Processing entire video...')
+        progress_cb(10)
+        payload = _transcription_payload(backend.transcribe(str(video_path), log_cb=log_cb))
+        result = normalize_result({
+            **payload,
+            'start': normalized_segments[0]['start'] if normalized_segments else 0.0,
+            'end': normalized_segments[0]['end'] if normalized_segments else video_duration(video_path),
+            'segment': 1,
+        })
+        results.append(result)
+        segment_cb(result)
+        progress_cb(100)
+        log_cb('✅ Complete — 1 segment(s)')
+        return results
+
+    temp_dir = Path(tempfile.mkdtemp(prefix='lipsight_'))
+    paths = []
+    try:
+        for index, segment in enumerate(normalized_segments, 1):
+            if should_stop():
+                break
+            log_cb(f"🎬 Preparing segment {index}/{len(normalized_segments)} [{segment['start']:.1f}s-{segment['end']:.1f}s]")
+            path = temp_dir / f'seg_{index:04d}.mp4'
+            try:
+                paths.append(extract_video_segment(video_path, segment['start'], segment['end'], path))
+            except Exception as exc:
+                log_cb(f'⚠️  Segment {index}: {exc}')
+                paths.append(None)
+
+        valid = [(index, segment, path) for index, (segment, path) in enumerate(zip(normalized_segments, paths), 1) if path]
+        batch_values = None
+        if valid and len(valid) == len(normalized_segments):
+            batch_values = _transcribe_batch(backend, [path for _, _, path in valid], log_cb=log_cb)
+
+        for position, (index, segment, path) in enumerate(valid):
+            if should_stop():
+                break
+            log_cb(f"🧠 Transcribing segment {index}/{len(normalized_segments)}")
+            value = batch_values[position] if batch_values is not None else backend.transcribe(str(path), log_cb=log_cb)
+            payload = _transcription_payload(value)
+            result = normalize_result({**payload, **segment, 'segment': index})
+            results.append(result)
+            segment_cb(result)
+            progress_cb(int(index / max(len(normalized_segments), 1) * 100))
+        log_cb(f'✅ Complete — {len(results)} segment(s)')
+        return results
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def create_backend(name, config=None):
+    config = config or {}
+    normalized = str(name or 'hf').strip().lower().replace('_', '-').replace(' ', '-')
+    if normalized in ('hf', 'huggingface', 'space'):
+        return HuggingFaceSpaceBackend(config.get('hf_space_url', ''))
+    if normalized in ('local', 'auto-avsr', 'autoavsr'):
+        return LocalAutoAVSRBackend()
+    if normalized in ('replicate', 'cloud'):
+        token = config.get('replicate_api_token', '')
+        if not token:
+            raise ValueError('Replicate backend requires an API token')
+        return ReplicateBackend(token)
+    if normalized in ('custom', 'endpoint', 'api'):
+        url = config.get('custom_endpoint', '')
+        if not url:
+            raise ValueError('custom backend requires an endpoint URL')
+        return DirectAPIBackend(url, config.get('custom_endpoint_key', ''))
+    raise ValueError(f'unknown backend: {name}')
+
+
+def _watch_candidates(folder):
+    return sorted(
+        (path for path in Path(folder).iterdir() if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS),
+        key=lambda path: path.name.casefold())
+
+
+def watch_folder(folder, backend, output_dir=None, auto_segment=True, threshold=0.06,
+                 interval=5.0, once=False, stop_event=None, log_cb=None):
+    """Poll a folder and process each new, stable video exactly once."""
+    folder = Path(folder).expanduser().resolve()
+    folder.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(output_dir or folder).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_cb = log_cb or (lambda _message: None)
+    stop_event = stop_event or threading.Event()
+    seen = set()
+    completed = []
+
+    while not stop_event.is_set():
+        for video in _watch_candidates(folder):
+            key = str(video.resolve())
+            if key in seen or video.name.endswith('.lipsight-processing.mp4'):
+                continue
+            marker = video.with_name(video.name + '.lipsight-processing')
+            try:
+                before = video.stat()
+                if before.st_size <= 0:
+                    continue
+                time.sleep(0.05)
+                after = video.stat()
+                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                    continue
+                marker.write_text(_utc_now(), encoding='utf-8')
+                segments = VideoSegmenter(threshold).segment(str(video), log_cb=log_cb) if auto_segment else None
+                results = process_video(str(video), backend, segments=segments, log_cb=log_cb)
+                output = output_dir / f'{video.stem}.srt'
+                export_srt(results, output)
+                SessionArchive().record(str(video), results, type(backend).__name__)
+                completed.append(output)
+                seen.add(key)
+                log_cb(f'✅ Watch complete: {video.name}')
+            except Exception as exc:
+                log_cb(f'❌ Watch failed for {video.name}: {exc}')
+                seen.add(key)
+            finally:
+                if marker.exists():
+                    marker.unlink()
+        if once:
+            return completed
+        stop_event.wait(max(0.1, float(interval)))
+    return completed
 
 
 # ── Workers ─────────────────────────────────────────────────────────────────
@@ -610,51 +1109,15 @@ class ProcessingWorker(QThread):
 
     def run(self):
         try:
-            results = []
-            if self.segs and len(self.segs) > 1:
-                td = tempfile.mkdtemp(prefix='lipsight_')
-                cap = cv2.VideoCapture(self.vpath)
-                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-                w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                cap.release()
-
-                for i,(s,e) in enumerate(self.segs):
-                    if self._stop: break
-                    self.log.emit(f"🎬 Segment {i+1}/{len(self.segs)} [{s:.1f}s-{e:.1f}s]")
-                    sp = os.path.join(td, f"seg_{i:04d}.mp4")
-                    try:
-                        subprocess.run(['ffmpeg','-y','-i',self.vpath,'-ss',str(s),'-t',str(e-s),
-                            '-c:v','libx264','-an','-preset','ultrafast',sp], capture_output=True, timeout=60)
-                    except:
-                        cap2 = cv2.VideoCapture(self.vpath)
-                        wr = cv2.VideoWriter(sp, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w,h))
-                        cap2.set(cv2.CAP_PROP_POS_FRAMES, int(s*fps))
-                        for _ in range(int((e-s)*fps)):
-                            ok,fr = cap2.read()
-                            if not ok: break
-                            wr.write(fr)
-                        wr.release(); cap2.release()
-
-                    if os.path.exists(sp) and os.path.getsize(sp) > 0:
-                        try:
-                            txt = self.backend.transcribe(sp, log_cb=self.log.emit)
-                            r = {'start':s,'end':e,'text':txt.strip(),'segment':i+1}
-                            results.append(r); self.segment_result.emit(r)
-                        except Exception as ex:
-                            self.log.emit(f"⚠️  Segment {i+1}: {ex}")
-                    self.progress.emit(int((i+1)/len(self.segs)*100))
-                shutil.rmtree(td, ignore_errors=True)
-            else:
-                self.log.emit("🎬 Processing entire video...")
-                self.progress.emit(10)
-                txt = self.backend.transcribe(self.vpath, log_cb=self.log.emit)
-                cap = cv2.VideoCapture(self.vpath)
-                dur = cap.get(cv2.CAP_PROP_FRAME_COUNT) / (cap.get(cv2.CAP_PROP_FPS) or 25.0)
-                cap.release()
-                r = {'start':0.0,'end':dur,'text':txt.strip(),'segment':1}
-                results.append(r); self.segment_result.emit(r); self.progress.emit(100)
-
-            self.log.emit(f"✅ Complete — {len(results)} segment(s)")
+            results = process_video(
+                self.vpath,
+                self.backend,
+                segments=self.segs,
+                progress_cb=self.progress.emit,
+                log_cb=self.log.emit,
+                segment_cb=self.segment_result.emit,
+                should_stop=lambda: self._stop,
+            )
             self.finished.emit(results)
         except Exception as e:
             self.error.emit(str(e))
@@ -684,7 +1147,7 @@ class FrameWorker(QThread):
                 a = FaceAnalyzer()
                 out, roi, ratio, _ = a.analyze_frame(frame) if a.available else (frame, None, 0.0, None)
                 a.close()
-            except: out, roi, ratio = frame, None, 0.0
+            except: out, ratio = frame, 0.0
             rgb = np.ascontiguousarray(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
             h, w, ch = rgb.shape
             img = QImage(rgb.data, w, h, ch*w, QImage.Format.Format_RGB888).copy()
@@ -1016,8 +1479,99 @@ class LipSightWindow(QMainWindow):
     def _ft(s): m=int(s)//60; sec=s-m*60; return f"{m:02d}:{sec:06.3f}"
 
 
+def build_cli_parser():
+    parser = argparse.ArgumentParser(
+        prog='lipsight',
+        description='Transcribe speech from silent video using LipSight.',
+    )
+    parser.add_argument('--input', help='input video path')
+    parser.add_argument('--output', help='output SRT/VTT/TXT/JSON path')
+    parser.add_argument('--output-format', choices=('srt', 'vtt', 'txt', 'json'), help='override output format')
+    parser.add_argument('--backend', default='hf', help='hf, local, replicate, or custom')
+    parser.add_argument('--hf-url', default='', help='custom HuggingFace Space URL')
+    parser.add_argument('--replicate-token', default='', help='Replicate API token')
+    parser.add_argument('--endpoint-url', default='', help='custom inference endpoint')
+    parser.add_argument('--endpoint-key', default='', help='custom endpoint bearer key')
+    parser.add_argument('--no-segmentation', action='store_true', help='process the full video as one segment')
+    parser.add_argument('--threshold', type=float, default=0.06, help='mouth movement threshold for segmentation')
+    parser.add_argument('--project', help='also save a .lipsight project')
+    parser.add_argument('--embed-video', action='store_true', help='embed input video in the project bundle')
+    parser.add_argument('--archive', help='JSONL session archive path')
+    parser.add_argument('--watch', help='watch a folder for new videos')
+    parser.add_argument('--watch-output', help='output folder for watch-mode subtitles')
+    parser.add_argument('--interval', type=float, default=5.0, help='watch polling interval in seconds')
+    parser.add_argument('--once', action='store_true', help='scan watch folder once and exit')
+    return parser
+
+
+def _cli_config(args):
+    return {
+        'hf_space_url': args.hf_url,
+        'replicate_api_token': args.replicate_token,
+        'custom_endpoint': args.endpoint_url,
+        'custom_endpoint_key': args.endpoint_key,
+    }
+
+
+def run_cli(argv=None):
+    parser = build_cli_parser()
+    args = parser.parse_args(argv)
+    if not args.input and not args.watch:
+        parser.error('--input or --watch is required for headless mode')
+    if args.input and args.watch:
+        parser.error('--input and --watch cannot be used together')
+
+    backend = create_backend(args.backend, _cli_config(args))
+    log_cb = lambda message: print(message, flush=True)
+    if args.watch:
+        watch_folder(
+            args.watch,
+            backend,
+            output_dir=args.watch_output,
+            auto_segment=not args.no_segmentation,
+            threshold=args.threshold,
+            interval=args.interval,
+            once=args.once,
+            log_cb=log_cb,
+        )
+        return 0
+
+    input_path = Path(args.input).expanduser().resolve()
+    if not input_path.is_file():
+        parser.error(f'input video not found: {input_path}')
+    segments = None
+    if not args.no_segmentation:
+        print('🔍 Analyzing mouth movement...', flush=True)
+        segments = VideoSegmenter(args.threshold).segment(str(input_path), log_cb=log_cb)
+    results = process_video(str(input_path), backend, segments=segments, log_cb=log_cb)
+    metadata = {'video_path': str(input_path), 'backend': args.backend}
+
+    if args.output:
+        output = export_results(results, args.output, fmt=args.output_format, metadata=metadata)
+        print(f'💾 Exported {output}', flush=True)
+    else:
+        print(json.dumps(build_result_document(results, metadata), ensure_ascii=False, indent=2), flush=True)
+    if args.project:
+        project = save_project(
+            args.project,
+            video_path=input_path,
+            segments=segments,
+            results=results,
+            include_video=args.embed_video,
+            metadata=metadata,
+        )
+        print(f'📦 Saved {project}', flush=True)
+    if args.archive:
+        SessionArchive(args.archive).record(str(input_path), results, args.backend, metadata)
+    return 0
+
+
 # ── Entry ───────────────────────────────────────────────────────────────────
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv:
+        return run_cli(argv)
+
     import traceback as _tb
     def _exc(t,v,tb):
         msg=''.join(_tb.format_exception(t,v,tb))
@@ -1041,7 +1595,7 @@ def main():
     font = app.font(); font.setFamily("Segoe UI"); font.setPointSize(10); app.setFont(font)
     w = LipSightWindow(); w.show()
     w.setWindowIcon(branding_icon)
-    sys.exit(app.exec())
+    return app.exec()
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
