@@ -247,6 +247,13 @@ def test_correction_store_builds_fine_tune_dataset(tmp_path):
     }]
 
 
+def test_global_hotkey_listener_uses_non_injected_modifier_registration():
+    listener = LipSight.GlobalHotkeyListener(lambda: None, key='F8', modifiers=('ctrl', 'alt'))
+
+    assert listener.KEY_CODES['F8'] == 0x77
+    assert listener._modifier_mask() == 0x0003
+
+
 @pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg is not installed')
 def test_burn_in_subtitles_writes_video(tmp_path):
     video = tmp_path / 'source.mp4'

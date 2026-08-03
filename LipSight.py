@@ -2030,6 +2030,78 @@ class Toast(QLabel):
         QTimer.singleShot(ms, self.deleteLater)
 
 
+class CaptionOverlay(QLabel):
+    """Optional always-on-top caption surface for accessibility and stream review."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setWordWrap(True)
+        self.setMinimumSize(520, 90)
+        self.setStyleSheet(
+            f"background-color:rgba(17,17,27,235);color:#ffffff;border:2px solid {C['blue']};"
+            "border-radius:12px;padding:14px;font-size:22px;font-weight:bold;"
+        )
+        self.set_caption('LipSight captions will appear here')
+
+    def set_caption(self, text):
+        self.setText(str(text or ''))
+        self.adjustSize()
+
+
+class GlobalHotkeyListener(threading.Thread):
+    """Listen for an opt-in hotkey without injecting input or taking focus."""
+
+    KEY_CODES = {f'F{number}': 0x70 + number - 1 for number in range(1, 13)}
+    KEY_CODES.update({'SPACE': 0x20, 'ESC': 0x1B})
+
+    def __init__(self, callback, key='F8', modifiers=('ctrl', 'alt')):
+        super().__init__(name='LipSightHotkey', daemon=True)
+        self.callback = callback
+        self.key = str(key).upper()
+        self.modifiers = tuple(str(modifier).lower() for modifier in modifiers)
+        self._stop_event = threading.Event()
+        self._thread_id = None
+        self.error = None
+
+    def _modifier_mask(self):
+        return sum({'alt': 0x0001, 'ctrl': 0x0002, 'shift': 0x0004, 'win': 0x0008}.get(modifier, 0) for modifier in self.modifiers)
+
+    def run(self):
+        if os.name != 'nt':
+            self.error = RuntimeError('global hotkeys are only supported on Windows')
+            return
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        hotkey_id = 0x4C53
+        vk = self.KEY_CODES.get(self.key)
+        if vk is None or not user32.RegisterHotKey(None, hotkey_id, self._modifier_mask(), vk):
+            self.error = RuntimeError(f'could not register hotkey: {self.modifiers}+{self.key}')
+            return
+        try:
+            message = wintypes.MSG()
+            while not self._stop_event.is_set():
+                result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result <= 0:
+                    break
+                if message.message == 0x0312:
+                    self.callback()
+        finally:
+            user32.UnregisterHotKey(None, hotkey_id)
+
+    def stop(self):
+        self._stop_event.set()
+        if os.name == 'nt' and self._thread_id:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2042,6 +2114,7 @@ class LipSightWindow(QMainWindow):
         self.cfg = load_config()
         self.video_path = None; self.video_info = {}; self.segments = []; self.results = []
         self.review_edits = []; self._curve_data = []
+        self.overlay = None; self.hotkey = None
         self._fw = self._sw = self._pw = None
         self._build(); self._connect()
         fa = FaceAnalyzer()
@@ -2063,7 +2136,9 @@ class LipSightWindow(QMainWindow):
         hl.addWidget(vl); hl.addStretch()
         self.badge = QLabel(BACKENDS[self.cfg.get('backend_index',0)])
         self.badge.setStyleSheet(f"background-color:{C['surface0']};color:{C['teal']};padding:4px 12px;border-radius:12px;font-size:12px;font-weight:bold;")
-        hl.addWidget(self.badge); root.addWidget(hdr)
+        hl.addWidget(self.badge)
+        self.b_overlay = QPushButton("◉ Overlay"); self.b_overlay.setObjectName("secondaryBtn"); self.b_overlay.setToolTip("Show captions in an always-on-top overlay")
+        hl.addWidget(self.b_overlay); root.addWidget(hdr)
 
         body = QWidget(); bl = QHBoxLayout(body); bl.setContentsMargins(12,12,12,0); bl.setSpacing(12)
 
@@ -2189,6 +2264,8 @@ class LipSightWindow(QMainWindow):
         self.chk_multi = QCheckBox("Label multiple speakers (A, B, ...)"); self.chk_multi.setChecked(self.cfg.get('multi_speaker', False)); sgl.addWidget(self.chk_multi)
         self.chk_accessible = QCheckBox("Accessibility mode (large, high-contrast captions)")
         self.chk_accessible.setChecked(self.cfg.get('accessibility_mode', False)); sgl.addWidget(self.chk_accessible)
+        self.chk_hotkey = QCheckBox("Ctrl+Alt+F8 toggles caption overlay")
+        self.chk_hotkey.setChecked(self.cfg.get('overlay_hotkey', False)); sgl.addWidget(self.chk_hotkey)
         sl.addWidget(sg)
 
         self.b_save = QPushButton("💾  Save Settings"); sl.addWidget(self.b_save); sl.addStretch()
@@ -2213,7 +2290,10 @@ class LipSightWindow(QMainWindow):
         self.bcpy.clicked.connect(self._copy); self.breview.clicked.connect(self._apply_review)
         self.bproject.clicked.connect(self._save_project); self.curve.segments_changed.connect(self._segments_changed)
         self.chk_accessible.toggled.connect(self._accessibility)
+        self.chk_hotkey.toggled.connect(self._hotkey_toggle)
+        self.b_overlay.clicked.connect(self._toggle_overlay)
         self._accessibility(self.chk_accessible.isChecked())
+        self._hotkey_toggle(self.chk_hotkey.isChecked())
 
     def _on_be(self, i): self.stack.setCurrentIndex(i); self.badge.setText(BACKENDS[i])
 
@@ -2320,6 +2400,8 @@ class LipSightWindow(QMainWindow):
         self.results = res; self.b_process.setEnabled(True); self.b_analyze.setEnabled(True); self.b_cancel.setEnabled(False); self._exp(True)
         full = '\n'.join(r['text'] for r in res if r['text']); self.txte.setPlainText(full)
         self.confidence_view.setHtml(confidence_overlay_html(res))
+        if self.overlay:
+            self.overlay.set_caption(full)
         self.statusBar().showMessage(f"Done — {len(res)} seg(s), {len(full.split())} words")
         Toast(self, f"  ✅  {len(res)} segments transcribed  ", C['green'])
 
@@ -2355,6 +2437,7 @@ class LipSightWindow(QMainWindow):
             'auto_segment': self.chk_seg.isChecked(),
             'multi_speaker': self.chk_multi.isChecked(),
             'accessibility_mode': self.chk_accessible.isChecked(),
+            'overlay_hotkey': self.chk_hotkey.isChecked(),
         })
         save_config(self.cfg); Toast(self, "  ✅  Saved  ", C['green']); self._log("💾 Settings saved")
 
@@ -2373,6 +2456,27 @@ class LipSightWindow(QMainWindow):
         else:
             self.txte.setStyleSheet('')
             self.confidence_view.setStyleSheet(f"background-color:{C['mantle']};border:1px solid {C['surface0']};padding:4px;")
+
+    def _toggle_overlay(self):
+        if self.overlay is None:
+            self.overlay = CaptionOverlay()
+        if self.overlay.isVisible():
+            self.overlay.hide()
+            self.b_overlay.setText("◉ Overlay")
+        else:
+            text = self.txte.toPlainText() or 'LipSight captions will appear here'
+            self.overlay.set_caption(text)
+            self.overlay.show()
+            self.b_overlay.setText("◉ Hide Overlay")
+
+    def _hotkey_toggle(self, enabled):
+        if self.hotkey:
+            self.hotkey.stop()
+            self.hotkey = None
+        if enabled and os.name == 'nt':
+            self.hotkey = GlobalHotkeyListener(self._toggle_overlay)
+            self.hotkey.start()
+            self._log("⌨️  Global overlay hotkey enabled: Ctrl+Alt+F8")
 
     def _apply_review(self):
         if not self.results:
@@ -2406,6 +2510,13 @@ class LipSightWindow(QMainWindow):
         except Exception as exc:
             self._log(f"❌ {exc}")
             Toast(self, "  ❌  Project failed  ", C['red'])
+
+    def closeEvent(self, event):
+        if self.hotkey:
+            self.hotkey.stop()
+        if self.overlay:
+            self.overlay.close()
+        super().closeEvent(event)
 
     def _pre_dl(self):
         self._log("📥 Pre-downloading local model..."); self.b_dl.setEnabled(False); self.b_dl.setText("⏳ Downloading...")
