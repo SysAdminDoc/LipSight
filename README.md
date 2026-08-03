@@ -1,6 +1,6 @@
 # LipSight
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.2.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
@@ -61,6 +61,15 @@ python LipSight.py  # Auto-installs all dependencies on first run
 4. *(Optional)* Click **Analyze Segments** to detect speech regions via mouth movement
 5. Click **Lip Read** to begin transcription
 6. Export results as SRT, TXT, JSON, or copy to clipboard
+
+For headless use, the same entrypoint exposes the CLI:
+
+```bash
+python LipSight.py --input a.mp4 --backend hf --output out.srt
+python LipSight.py --input a.mp4 --backend faster-whisper --language en --output out.vtt
+```
+
+Supported exports are SRT, WebVTT, TXT, and versioned JSON. Projects can be saved as `.lipsight` bundles; the GUI also provides review corrections, an aligned mouth preview, an optional caption overlay, and an accessibility mode.
 
 ## Configuration
 

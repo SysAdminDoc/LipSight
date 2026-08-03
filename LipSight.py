@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LipSight v1.1 — AI Lip Reading Tool
+LipSight v1.2 — AI Lip Reading Tool
 Powered by Auto-AVSR (state-of-the-art visual speech recognition)
 Supports: Local PyTorch inference (FREE), HuggingFace Spaces (FREE), Replicate API, Custom Endpoints
 """
@@ -33,8 +33,16 @@ def _branding_icon_path() -> Path:
 
 
 # ── Auto-Bootstrap ──────────────────────────────────────────────────────────
+def _python_command():
+    if not getattr(sys, 'frozen', False):
+        return sys.executable
+    return shutil.which('python') or shutil.which('python3') or ''
+
+
 def _bootstrap():
     """Auto-install dependencies and configure prerequisites."""
+    if getattr(sys, 'frozen', False):
+        return
     if sys.version_info < (3, 8):
         print("Python 3.8+ required"); sys.exit(1)
 
@@ -48,7 +56,7 @@ def _bootstrap():
             for flags in [[], ['--user'], ['--break-system-packages']]:
                 try:
                     subprocess.check_call(
-                        [sys.executable, '-m', 'pip', 'install', pkg, '-q'] + flags,
+                        [_python_command(), '-m', 'pip', 'install', pkg, '-q'] + flags,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     break
                 except subprocess.CalledProcessError:
@@ -83,7 +91,7 @@ from PyQt6.QtCore import *
 from PyQt6.QtGui import QBrush, QColor, QIcon, QImage, QPainter, QPen, QPixmap
 
 APP_NAME = "LipSight"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 RESULT_SCHEMA_VERSION = "1.0"
 PROJECT_SCHEMA_VERSION = "1.0"
 CORRECTION_SCHEMA_VERSION = "1.0"
@@ -969,6 +977,9 @@ class LocalAutoAVSRBackend:
         self._ready = False
 
     def _pip(self, pkgs, log_cb=None):
+        python_cmd = _python_command()
+        if not python_cmd:
+            raise RuntimeError('Python is required to install optional local-model dependencies')
         for pkg in pkgs:
             mod = pkg.split('[')[0].split('=')[0].split('>')[0].split('<')[0].replace('-','_').lower()
             if mod == 'opencv_python': mod = 'cv2'
@@ -977,7 +988,7 @@ class LocalAutoAVSRBackend:
             if log_cb: log_cb(f"   📦 Installing {pkg}...")
             for fl in [[], ['--user'], ['--break-system-packages']]:
                 try:
-                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg, '-q'] + fl, timeout=600)
+                    subprocess.check_call([python_cmd, '-m', 'pip', 'install', pkg, '-q'] + fl, timeout=600)
                     break
                 except: continue
 
@@ -990,10 +1001,13 @@ class LocalAutoAVSRBackend:
             import torch
             if log_cb: log_cb(f"   ✅ PyTorch {torch.__version__} (CUDA: {torch.cuda.is_available()})")
         except ImportError:
+            python_cmd = _python_command()
+            if not python_cmd:
+                raise RuntimeError('install Python and run the local model setup outside the packaged executable')
             if log_cb: log_cb("   📦 Installing PyTorch (may take several minutes)...")
             for cmd in [
-                [sys.executable, '-m', 'pip', 'install', 'torch', 'torchvision', 'torchaudio', '--index-url', 'https://download.pytorch.org/whl/cu121', '-q'],
-                [sys.executable, '-m', 'pip', 'install', 'torch', 'torchvision', 'torchaudio', '-q'],
+                [python_cmd, '-m', 'pip', 'install', 'torch', 'torchvision', 'torchaudio', '--index-url', 'https://download.pytorch.org/whl/cu121', '-q'],
+                [python_cmd, '-m', 'pip', 'install', 'torch', 'torchvision', 'torchaudio', '-q'],
             ]:
                 try: subprocess.check_call(cmd, timeout=900); break
                 except: continue
@@ -1017,7 +1031,10 @@ class LocalAutoAVSRBackend:
         # Install package
         if log_cb: log_cb("   📦 Installing Auto-AVSR package...")
         try:
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-e', repo, '-q'], timeout=300)
+            python_cmd = _python_command()
+            if not python_cmd:
+                raise RuntimeError('Python is required to install Auto-AVSR')
+            subprocess.check_call([python_cmd, '-m', 'pip', 'install', '-e', repo, '-q'], timeout=300)
         except:
             if repo not in sys.path: sys.path.insert(0, repo)
 
