@@ -288,7 +288,10 @@ def normalize_segments(segments):
         end = _timestamp_value(end, 'segment.end')
         if end < start:
             raise ValueError('segment.end must be greater than or equal to segment.start')
-        normalized.append({'start': start, 'end': end})
+        item = {'start': start, 'end': end}
+        if isinstance(raw_segment, dict) and raw_segment.get('speaker'):
+            item['speaker'] = str(raw_segment['speaker'])
+        normalized.append(item)
     return normalized
 
 
@@ -432,6 +435,145 @@ class SessionArchive:
         return matches
 
 
+# ── Mouth preprocessing ────────────────────────────────────────────────────
+def align_mouth_roi(frame, points, output_size=(96, 96)):
+    """Rotate, crop, and resize a mouth landmark cloud to a canonical pose."""
+    if frame is None or getattr(frame, 'size', 0) == 0:
+        raise ValueError('frame is empty')
+    if points is None:
+        raise ValueError('mouth landmarks are required for alignment')
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(points) < 4:
+        raise ValueError('at least four mouth landmarks are required')
+
+    center = points.mean(axis=0)
+    _, eigenvectors, _ = cv2.PCACompute2(points - center, mean=None)
+    angle = math.degrees(math.atan2(float(eigenvectors[0, 1]), float(eigenvectors[0, 0])))
+    rotation = cv2.getRotationMatrix2D((float(center[0]), float(center[1])), angle, 1.0)
+    rotated = cv2.warpAffine(frame, rotation, (frame.shape[1], frame.shape[0]), borderMode=cv2.BORDER_REPLICATE)
+    rotated_points = cv2.transform(points[None, :, :], rotation)[0]
+    x1, y1 = np.floor(rotated_points.min(axis=0) - 8).astype(int)
+    x2, y2 = np.ceil(rotated_points.max(axis=0) + 8).astype(int)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(rotated.shape[1], x2), min(rotated.shape[0], y2)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError('mouth landmarks do not define a valid ROI')
+    crop = rotated[y1:y2, x1:x2]
+    return cv2.resize(crop, tuple(output_size), interpolation=cv2.INTER_AREA)
+
+
+def normalize_lighting(crop, clip_limit=2.0, tile_grid=(8, 8)):
+    """Apply CLAHE to the luminance channel without changing mouth colors."""
+    if crop is None or getattr(crop, 'size', 0) == 0:
+        return crop
+    if len(crop.shape) == 2:
+        return cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid).apply(crop)
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    lightness, a_channel, b_channel = cv2.split(lab)
+    lightness = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid).apply(lightness)
+    return cv2.cvtColor(cv2.merge((lightness, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
+
+
+class MouthStabilizer:
+    """Optical-flow stabilizer for sequential mouth crops."""
+
+    def __init__(self):
+        self._previous = None
+
+    def reset(self):
+        self._previous = None
+
+    def stabilize(self, crop):
+        if crop is None or getattr(crop, 'size', 0) == 0:
+            return crop
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+        gray = gray.astype(np.float32) / 255.0
+        if self._previous is None:
+            self._previous = gray.copy()
+            return crop
+        warp = np.eye(2, 3, dtype=np.float32)
+        try:
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 25, 1e-4)
+            cv2.findTransformECC(self._previous, gray, warp, cv2.MOTION_AFFINE, criteria)
+            stabilized = cv2.warpAffine(
+                crop, warp, (crop.shape[1], crop.shape[0]),
+                flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+        except cv2.error:
+            stabilized = crop
+        self._previous = gray.copy()
+        return stabilized
+
+
+class SuperResolutionProcessor:
+    """Optional OpenCV DNN super-resolution for small face crops."""
+
+    def __init__(self, model_path='', model_name='edsr', scale=4):
+        self.model_path = str(model_path or '')
+        self.model_name = model_name
+        self.scale = int(scale)
+        self._model = None
+
+    def _load(self):
+        if self._model is not None or not self.model_path:
+            return self._model
+        dnn_superres = getattr(cv2, 'dnn_superres', None)
+        if dnn_superres is None or not os.path.isfile(self.model_path):
+            return None
+        try:
+            model = dnn_superres.DnnSuperResImpl_create()
+            model.readModel(self.model_path)
+            model.setModel(self.model_name, self.scale)
+            self._model = model
+        except (cv2.error, OSError):
+            self._model = None
+        return self._model
+
+    def enhance(self, crop, minimum_size=96):
+        if crop is None or getattr(crop, 'size', 0) == 0:
+            return crop
+        if min(crop.shape[:2]) >= minimum_size:
+            return crop
+        model = self._load()
+        if model is not None:
+            try:
+                return model.upsample(crop)
+            except cv2.error:
+                pass
+        scale = max(1.0, minimum_size / min(crop.shape[:2]))
+        size = (max(minimum_size, int(crop.shape[1] * scale)), max(minimum_size, int(crop.shape[0] * scale)))
+        return cv2.resize(crop, size, interpolation=cv2.INTER_CUBIC)
+
+
+class MouthPreprocessor:
+    """Canonical mouth crop pipeline: alignment, enhancement, stabilization, CLAHE."""
+
+    def __init__(self, output_size=(96, 96), super_resolution_model='', stabilize=True, clahe=True):
+        self.output_size = tuple(output_size)
+        self.super_resolution = SuperResolutionProcessor(super_resolution_model)
+        self.stabilizer = MouthStabilizer() if stabilize else None
+        self.clahe = clahe
+
+    def reset(self):
+        if self.stabilizer:
+            self.stabilizer.reset()
+
+    def process(self, frame, roi=None, points=None):
+        if points is not None:
+            crop = align_mouth_roi(frame, points, self.output_size)
+        elif roi is not None:
+            x1, y1, x2, y2 = [int(value) for value in roi]
+            crop = frame[max(0, y1):max(y1 + 1, y2), max(0, x1):max(x1 + 1, x2)]
+            crop = self.super_resolution.enhance(crop)
+            crop = cv2.resize(crop, self.output_size, interpolation=cv2.INTER_AREA)
+        else:
+            raise ValueError('roi or points are required')
+        if self.stabilizer:
+            crop = self.stabilizer.stabilize(crop)
+        return normalize_lighting(crop) if self.clahe else crop
+
+
 # ── Face Detection ──────────────────────────────────────────────────────────
 class FaceAnalyzer:
     """Face/mouth detection: MediaPipe preferred, OpenCV Haar cascade fallback."""
@@ -447,7 +589,7 @@ class FaceAnalyzer:
         if _HAS_MEDIAPIPE:
             try:
                 self.face_mesh = _mp.solutions.face_mesh.FaceMesh(
-                    static_image_mode=False, max_num_faces=1,
+                    static_image_mode=False, max_num_faces=5,
                     refine_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5)
                 self._backend = 'mediapipe'
             except Exception:
@@ -475,18 +617,17 @@ class FaceAnalyzer:
     def _mp(self, frame):
         h, w = frame.shape[:2]
         out = frame.copy()
-        roi, ratio = None, 0.0
+        observations = []
         try:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             res = self.face_mesh.process(rgb)
-            if res.multi_face_landmarks:
-                lm = res.multi_face_landmarks[0]
+            for face_index, lm in enumerate(res.multi_face_landmarks or []):
                 pts = [(int(lm.landmark[i].x*w), int(lm.landmark[i].y*h)) for i in self.MOUTH_OUTER]
                 if pts:
                     arr = np.array(pts)
                     x1, y1 = arr.min(0) - 20; x2, y2 = arr.max(0) + 20
                     x1, y1, x2, y2 = max(0,x1), max(0,y1), min(w,x2), min(h,y2)
-                    roi = (x1, y1, x2, y2)
+                    roi = (int(x1), int(y1), int(x2), int(y2))
                     cv2.rectangle(out, (x1,y1), (x2,y2), (137,180,250), 2)
                     for i in self.MOUTH_OUTER:
                         cv2.circle(out, (int(lm.landmark[i].x*w), int(lm.landmark[i].y*h)), 2, (166,227,161), -1)
@@ -497,33 +638,53 @@ class FaceAnalyzer:
                     mh = math.sqrt((t.x-b.x)**2+(t.y-b.y)**2)
                     mw = math.sqrt((l.x-r.x)**2+(l.y-r.y)**2)
                     ratio = mh / max(mw, 0.001)
+                    observations.append({
+                        'index': face_index,
+                        'roi': roi,
+                        'points': pts,
+                        'open_ratio': ratio,
+                        'center': (float((x1 + x2) / 2), float((y1 + y2) / 2)),
+                    })
                     col = (166,227,161) if ratio > 0.06 else (108,112,134)
                     cv2.putText(out, "SPEAKING" if ratio>0.06 else "SILENT", (x1,y1-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
         except: pass
-        return out, roi, ratio, None
+        if observations:
+            primary = observations[0]
+            return out, primary['roi'], primary['open_ratio'], {'faces': observations}
+        return out, None, 0.0, {'faces': []}
 
     def _cv(self, frame):
         h, w = frame.shape[:2]
         out = frame.copy()
-        roi, ratio = None, 0.0
+        observations = []
         try:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = self._cascade.detectMultiScale(gray, 1.1, 5, minSize=(80,80))
-            if len(faces) > 0:
-                fx,fy,fw,fh = faces[0]
+            for face_index, (fx,fy,fw,fh) in enumerate(faces):
                 cv2.rectangle(out, (fx,fy), (fx+fw,fy+fh), (69,71,90), 1)
                 mx1, my1 = max(0,fx+int(fw*0.2)), max(0,fy+int(fh*0.65))
                 mx2, my2 = min(w,fx+int(fw*0.8)), min(h,fy+fh+5)
-                roi = (mx1, my1, mx2, my2)
+                roi = (int(mx1), int(my1), int(mx2), int(my2))
                 cv2.rectangle(out, (mx1,my1), (mx2,my2), (137,180,250), 2)
                 mg = gray[my1:my2, mx1:mx2]
+                ratio = 0.0
                 if mg.size > 0:
                     gx = cv2.Sobel(mg, cv2.CV_64F, 1, 0, ksize=3)
                     gy = cv2.Sobel(mg, cv2.CV_64F, 0, 1, ksize=3)
                     ratio = min(np.mean(np.sqrt(gx**2+gy**2)) / 50.0, 0.3)
+                observations.append({
+                    'index': face_index,
+                    'roi': roi,
+                    'points': None,
+                    'open_ratio': ratio,
+                    'center': (float(fx + fw / 2), float(fy + fh / 2)),
+                })
                 cv2.putText(out, "DETECTED", (mx1,my1-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (137,180,250), 1, cv2.LINE_AA)
         except: pass
-        return out, roi, ratio, None
+        if observations:
+            primary = observations[0]
+            return out, primary['roi'], primary['open_ratio'], {'faces': observations}
+        return out, None, 0.0, {'faces': []}
 
     def close(self):
         if self.face_mesh:
@@ -535,46 +696,76 @@ class FaceAnalyzer:
 class VideoSegmenter:
     def __init__(self, threshold=0.06):
         self.threshold = threshold
+        self.last_curve = []
+        self.last_speaker_curves = {}
 
-    def segment(self, video_path, progress_cb=None, log_cb=None):
+    def segment(self, video_path, progress_cb=None, log_cb=None, multi_speaker=False):
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened(): raise RuntimeError(f"Cannot open: {video_path}")
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.last_curve = []
+        self.last_speaker_curves = {}
         analyzer = FaceAnalyzer()
         if not analyzer.available:
             cap.release()
             if log_cb: log_cb("⚠️  No face detection — whole video as one segment")
-            return [(0.0, total/fps)]
+            fallback = {'start': 0.0, 'end': total/fps, 'speaker': 'A'}
+            return [fallback] if multi_speaker else [(0.0, total/fps)]
 
         if log_cb: log_cb(f"📐 Analyzing {total} frames ({analyzer.backend_name})...")
-        ratios = []; idx = 0; step = max(1, int(fps/10))
+        ratios = []; speaker_ratios = {}; idx = 0; step = max(1, int(fps/10))
         while True:
             ret, frame = cap.read()
             if not ret: break
             if idx % step == 0:
-                _, _, r, _ = analyzer.analyze_frame(frame)
+                _, _, r, info = analyzer.analyze_frame(frame)
                 ratios.append((idx, r))
+                self.last_curve.append((idx / fps, r))
+                if multi_speaker:
+                    faces = sorted((info or {}).get('faces', []), key=lambda face: face.get('center', (0, 0))[0])
+                    for speaker_index, face in enumerate(faces):
+                        speaker_ratios.setdefault(speaker_index, []).append((idx, face.get('open_ratio', 0.0)))
             idx += 1
             if progress_cb and idx % 50 == 0: progress_cb(int(idx/max(total,1)*100))
         cap.release(); analyzer.close()
         if not ratios: return [(0.0, total/fps)]
 
-        ms, ml = int(0.5*25), int(0.3*25)
-        segs, speech, start, sil = [], False, 0, 0
-        for fn, r in ratios:
-            if r > self.threshold:
-                if not speech: start = fn; speech = True
-                sil = 0
-            elif speech:
-                sil += step
-                if sil >= ml:
-                    end = fn - sil
-                    if (end-start) >= ms: segs.append((start/fps, end/fps))
-                    speech = False; sil = 0
-        if speech:
-            end = ratios[-1][0]
-            if (end-start) >= ms: segs.append((start/fps, end/fps))
+        def find_segments(samples):
+            ms, ml = int(0.5*25), int(0.3*25)
+            found, speech, start, silence = [], False, 0, 0
+            for frame_number, ratio in samples:
+                if ratio > self.threshold:
+                    if not speech:
+                        start = frame_number
+                        speech = True
+                    silence = 0
+                elif speech:
+                    silence += step
+                    if silence >= ml:
+                        end = frame_number - silence
+                        if (end-start) >= ms:
+                            found.append((start/fps, end/fps))
+                        speech = False
+                        silence = 0
+            if speech:
+                end = samples[-1][0]
+                if (end-start) >= ms:
+                    found.append((start/fps, end/fps))
+            return found
+
+        segs = find_segments(ratios)
+        if multi_speaker and speaker_ratios:
+            speaker_segments = []
+            self.last_speaker_curves = {}
+            for speaker_index, samples in sorted(speaker_ratios.items()):
+                label = chr(ord('A') + speaker_index)
+                self.last_speaker_curves[label] = [(frame / fps, ratio) for frame, ratio in samples]
+                speaker_segments.extend({
+                    'start': start, 'end': end, 'speaker': label,
+                } for start, end in find_segments(samples))
+            if speaker_segments:
+                segs = sorted(speaker_segments, key=lambda segment: (segment['start'], segment['speaker']))
         if log_cb: log_cb(f"🔍 Found {len(segs)} speech segments")
         return segs if segs else [(0.0, total/fps)]
 

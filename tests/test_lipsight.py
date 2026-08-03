@@ -129,3 +129,22 @@ def test_cli_parser_supports_headless_options():
     assert args.input == 'clip.mp4'
     assert args.backend == 'custom'
     assert args.no_segmentation is True
+
+
+def test_mouth_preprocessor_aligns_and_normalizes_roi():
+    frame = np.zeros((160, 200, 3), dtype=np.uint8)
+    frame[60:105, 70:140] = (40, 80, 140)
+    points = np.array([[75, 80], [95, 68], [120, 70], [138, 83], [112, 100], [88, 101]], dtype=np.float32)
+
+    crop = LipSight.MouthPreprocessor(output_size=(64, 64)).process(frame, points=points)
+
+    assert crop.shape == (64, 64, 3)
+    assert crop.dtype == np.uint8
+
+
+def test_super_resolution_fallback_upscales_small_crop():
+    crop = np.zeros((12, 20, 3), dtype=np.uint8)
+
+    result = LipSight.SuperResolutionProcessor().enhance(crop, minimum_size=48)
+
+    assert min(result.shape[:2]) >= 48
