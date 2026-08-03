@@ -1,5 +1,7 @@
 import json
+import shutil
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import cv2
@@ -164,3 +166,78 @@ def test_apply_review_text_preserves_timing_and_records_edits():
         {'segment': 1, 'before': 'hello', 'after': 'hi'},
         {'segment': 2, 'before': 'world', 'after': 'there'},
     ]
+
+
+def test_onnx_backend_adapts_channel_first_and_time_first_shapes():
+    frames = np.zeros((5, 96, 96), dtype=np.float32)
+
+    time_first = LipSight.LocalONNXBackend._adapt_input(frames, [1, 'T', 1, 96, 96])
+    channel_first = LipSight.LocalONNXBackend._adapt_input(frames, [1, 1, 'T', 96, 96])
+
+    assert time_first.shape == (1, 5, 1, 96, 96)
+    assert channel_first.shape == (1, 1, 5, 96, 96)
+
+
+def test_command_backend_parses_json_runner_output(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({'text': 'runner result'}), stderr='')
+
+    monkeypatch.setattr(LipSight.subprocess, 'run', fake_run)
+    backend = LipSight.CommandModelBackend(['runner.exe'], extra_args=['--video', '{video}'], label='test runner')
+
+    result = backend.transcribe(tmp_path / 'clip.mp4')
+
+    assert result['text'] == 'runner result'
+    assert calls[0][-1].endswith('clip.mp4')
+
+
+def test_audio_visual_fusion_prefers_high_confidence_audio_word():
+    class Backend:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def transcribe(self, _path, log_cb=None):
+            return self.payload
+
+    visual = {'text': 'hello world', 'confidence': 0.4, 'words': [
+        {'text': 'hello', 'start': 0, 'end': 1, 'confidence': 0.4},
+        {'text': 'world', 'start': 1, 'end': 2, 'confidence': 0.4},
+    ]}
+    audio = {'text': 'hello word', 'confidence': 0.9, 'words': [
+        {'text': 'hello', 'start': 0, 'end': 1, 'confidence': 0.9},
+        {'text': 'word', 'start': 1, 'end': 2, 'confidence': 0.9},
+    ]}
+
+    fused = LipSight.AudioVisualFusionBackend(Backend(visual), Backend(audio)).transcribe('clip.mp4')
+
+    assert fused['text'] == 'hello word'
+    assert fused['confidence'] == 0.9
+
+
+def test_confidence_overlay_colors_each_word():
+    overlay = LipSight.confidence_overlay_html([{
+        'start': 0,
+        'end': 1,
+        'text': 'sure maybe',
+        'words': [
+            {'text': 'sure', 'confidence': 0.9},
+            {'text': 'maybe', 'confidence': 0.2},
+        ],
+    }])
+
+    assert 'sure' in overlay and LipSight.C['green'] in overlay
+    assert 'maybe' in overlay and LipSight.C['red'] in overlay
+
+
+@pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg is not installed')
+def test_burn_in_subtitles_writes_video(tmp_path):
+    video = tmp_path / 'source.mp4'
+    _video(video)
+
+    output = LipSight.burn_in_subtitles(video, [_result('burned')], tmp_path / 'burned.mp4')
+
+    assert output.is_file()
+    assert output.stat().st_size > 0

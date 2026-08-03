@@ -5,8 +5,9 @@ Powered by Auto-AVSR (state-of-the-art visual speech recognition)
 Supports: Local PyTorch inference (FREE), HuggingFace Spaces (FREE), Replicate API, Custom Endpoints
 """
 
-import sys, os, subprocess, json, time, tempfile, threading, math, hashlib, random, shutil
+import sys, os, subprocess, json, time, tempfile, threading, math, hashlib, random, shutil, html
 import argparse
+import shlex
 import uuid
 import zipfile
 from pathlib import Path
@@ -306,6 +307,32 @@ def apply_review_text(results, edited_text):
             edits.append({'segment': result['segment'], 'before': result['text'], 'after': replacement})
         updated.append({**result, 'text': replacement})
     return updated, edits
+
+
+def confidence_overlay_html(results):
+    """Render word-level confidence colors for the review surface."""
+    spans = []
+    for result in normalize_results(results):
+        words = result['words'] or [
+            {'text': word, 'confidence': result['confidence']}
+            for word in result['text'].split()
+        ]
+        for word in words:
+            confidence = word.get('confidence')
+            if confidence is None:
+                color = C['overlay1']
+                label = 'confidence unavailable'
+            elif confidence >= 0.75:
+                color = C['green']
+                label = f'{confidence:.0%}'
+            elif confidence >= 0.5:
+                color = C['peach']
+                label = f'{confidence:.0%}'
+            else:
+                color = C['red']
+                label = f'{confidence:.0%}'
+            spans.append(f'<span title="{label}" style="color:{color}">{html.escape(word["text"])}</span>')
+    return ' '.join(spans)
 
 
 def normalize_segments(segments):
@@ -1045,6 +1072,379 @@ class DirectAPIBackend:
         return d.get('text', d.get('transcription', str(d)))
 
 
+def _extract_audio(video_path):
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        raise RuntimeError('ffmpeg is required for audio inference')
+    handle = tempfile.NamedTemporaryFile(prefix='lipsight_audio_', suffix='.wav', delete=False)
+    audio_path = Path(handle.name)
+    handle.close()
+    completed = subprocess.run(
+        [ffmpeg, '-y', '-i', str(video_path), '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', str(audio_path)],
+        capture_output=True, text=True, timeout=120)
+    if completed.returncode != 0 or not audio_path.is_file() or audio_path.stat().st_size == 0:
+        if audio_path.exists():
+            audio_path.unlink()
+        detail = (completed.stderr or completed.stdout or 'audio extraction failed').strip().splitlines()[-1]
+        raise RuntimeError(detail)
+    return audio_path
+
+
+def _parse_timecode(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    value = str(value or '').strip().replace(',', '.')
+    try:
+        parts = [float(part) for part in value.split(':')]
+    except ValueError:
+        return 0.0
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    return parts[0] if parts else 0.0
+
+
+def _command_parts(command):
+    if isinstance(command, (list, tuple)):
+        return [str(part) for part in command]
+    if not command:
+        return []
+    return shlex.split(str(command), posix=False)
+
+
+def _parse_backend_output(output):
+    output = str(output or '').strip()
+    if not output:
+        return {'text': ''}
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return {'text': output.splitlines()[-1].strip()}
+    if isinstance(payload, dict):
+        if 'text' in payload or 'transcription' in payload:
+            return payload
+        if 'results' in payload and payload['results']:
+            return payload['results'][0]
+    if isinstance(payload, list) and payload:
+        return payload[0] if isinstance(payload[0], dict) else {'text': ' '.join(str(item) for item in payload)}
+    return {'text': str(payload)}
+
+
+class LocalONNXBackend:
+    """Local ONNX visual inference adapter with CPU/CUDA/DirectML provider selection."""
+
+    def __init__(self, model_path='', tokenizer_path='', provider='CPUExecutionProvider', input_size=(96, 96)):
+        self.model_path = Path(model_path).expanduser() if model_path else None
+        self.tokenizer_path = Path(tokenizer_path).expanduser() if tokenizer_path else None
+        self.provider = provider or 'CPUExecutionProvider'
+        self.input_size = tuple(input_size)
+        self._session = None
+        self._tokenizer = None
+
+    def _ensure_session(self):
+        if self._session is not None:
+            return self._session
+        if not self.model_path or not self.model_path.is_file():
+            raise RuntimeError('Local ONNX backend requires a configured .onnx model path')
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError('install onnxruntime to use the Local ONNX backend') from exc
+        providers = ort.get_available_providers()
+        selected = self.provider if self.provider in providers else 'CPUExecutionProvider'
+        self._session = ort.InferenceSession(str(self.model_path), providers=[selected])
+        return self._session
+
+    def _load_tokenizer(self):
+        if self._tokenizer is not None or not self.tokenizer_path:
+            return self._tokenizer
+        try:
+            payload = json.loads(self.tokenizer_path.read_text(encoding='utf-8'))
+            self._tokenizer = payload.get('id_to_token', payload.get('vocab', payload))
+        except (OSError, json.JSONDecodeError):
+            self._tokenizer = {}
+        return self._tokenizer
+
+    def _frames(self, video_path):
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f'cannot open video: {video_path}')
+        analyzer = FaceAnalyzer()
+        preprocessor = MouthPreprocessor(output_size=self.input_size, stabilize=True)
+        frames = []
+        index = 0
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if index % 2 == 0:
+                    try:
+                        _annotated, roi, _ratio, details = analyzer.analyze_frame(frame)
+                        face = ((details or {}).get('faces') or [{}])[0]
+                        crop = preprocessor.process(frame, roi=roi, points=face.get('points')) if roi else cv2.resize(frame, self.input_size)
+                    except Exception:
+                        crop = cv2.resize(frame, self.input_size)
+                    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+                    frames.append(gray)
+                index += 1
+        finally:
+            cap.release()
+            analyzer.close()
+        if not frames:
+            raise RuntimeError('video contains no frames')
+        return np.stack(frames, axis=0)
+
+    @staticmethod
+    def _adapt_input(frames, shape):
+        batch = frames[None, :, None, :, :].astype(np.float32)
+        rank = len(shape)
+        dim_one = lambda value: value in (1, 3)
+        if rank == 5:
+            if dim_one(shape[1]) and not dim_one(shape[2]):
+                return batch.transpose(0, 2, 1, 3, 4)
+            return batch
+        if rank == 4:
+            if dim_one(shape[1]):
+                return batch[:, :, 0, :, :]
+            return batch[0]
+        if rank == 3:
+            return batch[:, :, 0, :, :]
+        raise RuntimeError(f'unsupported ONNX input rank: {rank}')
+
+    def _decode(self, output):
+        if isinstance(output, dict):
+            if 'text' in output:
+                return output
+            output = next(iter(output.values()), '')
+        if isinstance(output, (list, tuple)) and output and not isinstance(output, np.ndarray):
+            output = output[0]
+        array = np.asarray(output)
+        if array.dtype.kind in 'USO':
+            return {'text': ' '.join(str(item) for item in array.reshape(-1)).strip()}
+        if array.dtype.kind == 'f' and array.ndim >= 2:
+            confidence = float(np.max(array, axis=-1).mean())
+            array = array.argmax(axis=-1)
+        else:
+            confidence = None
+        tokenizer = self._load_tokenizer() or {}
+        tokens = []
+        for token_id in array.reshape(-1):
+            key = str(int(token_id))
+            token = tokenizer.get(key, tokenizer.get(int(token_id), key))
+            token = str(token)
+            if token in ('<pad>', '<blank>', '<s>', '</s>'):
+                continue
+            tokens.append(token.replace('▁', ' ').replace('Ġ', ' '))
+        return {'text': ''.join(tokens).strip(), 'confidence': confidence}
+
+    def transcribe(self, video_path, log_cb=None):
+        session = self._ensure_session()
+        if log_cb:
+            log_cb('💻 Running local ONNX visual inference...')
+        frames = self._frames(video_path)
+        input_meta = session.get_inputs()[0]
+        tensor = self._adapt_input(frames, input_meta.shape)
+        output = session.run(None, {input_meta.name: tensor})
+        return self._decode(output[0] if output else '')
+
+    def transcribe_batch(self, video_paths, log_cb=None):
+        return [self.transcribe(path, log_cb=log_cb) for path in video_paths]
+
+
+class CommandModelBackend:
+    """Adapter for reproducible local VALLR/AV-HuBERT command-line runners."""
+
+    def __init__(self, command='', model_path='', label='model', extra_args=None):
+        self.command = _command_parts(command)
+        self.model_path = str(Path(model_path).expanduser()) if model_path else ''
+        self.label = label
+        self.extra_args = list(extra_args or [])
+
+    def transcribe(self, video_path, log_cb=None):
+        if not self.command:
+            raise RuntimeError(f'{self.label} backend requires a configured runner command')
+        args = [part.format(video=str(video_path), model=self.model_path) for part in self.extra_args]
+        if not args:
+            args = ['--video_path', str(video_path)]
+            if self.model_path:
+                args.extend(['--model', self.model_path])
+        if log_cb:
+            log_cb(f'🧠 Running {self.label}...')
+        completed = subprocess.run(self.command + args, capture_output=True, text=True, timeout=900)
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or 'runner failed').strip().splitlines()[-1]
+            raise RuntimeError(f'{self.label}: {detail}')
+        return _parse_backend_output(completed.stdout)
+
+
+class VALLRBackend(CommandModelBackend):
+    def __init__(self, command='', model_path=''):
+        super().__init__(command, model_path, 'VALLR')
+
+
+class AVHuBERTBackend(CommandModelBackend):
+    def __init__(self, command='', model_path=''):
+        super().__init__(command, model_path, 'AV-HuBERT')
+
+
+class FasterWhisperBackend:
+    """Optional local audio transcription with word timestamps."""
+
+    def __init__(self, model='small', device='auto', compute_type='int8'):
+        self.model_name = model
+        self.device = device
+        self.compute_type = compute_type
+        self._model = None
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return self._model
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError('install faster-whisper to use the local audio backend') from exc
+        device = self.device
+        if device == 'auto':
+            try:
+                import torch
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            except ImportError:
+                device = 'cpu'
+        compute_type = self.compute_type if device == 'cuda' else 'int8'
+        self._model = WhisperModel(self.model_name, device=device, compute_type=compute_type)
+        return self._model
+
+    def transcribe(self, video_path, log_cb=None):
+        if log_cb:
+            log_cb(f'🎙️  Transcribing audio with faster-whisper ({self.model_name})...')
+        audio = _extract_audio(video_path)
+        try:
+            segments, _info = self._ensure_model().transcribe(str(audio), word_timestamps=True, vad_filter=True)
+            words = []
+            texts = []
+            confidences = []
+            start = end = 0.0
+            for segment in segments:
+                start = float(segment.start) if not texts else start
+                end = float(segment.end)
+                texts.append(segment.text.strip())
+                for word in (segment.words or []):
+                    probability = getattr(word, 'probability', None)
+                    words.append({'text': word.word.strip(), 'start': word.start, 'end': word.end, 'confidence': probability})
+                    if probability is not None:
+                        confidences.append(probability)
+            return {
+                'text': ' '.join(texts).strip(),
+                'start': start,
+                'end': end,
+                'words': words,
+                'confidence': sum(confidences) / len(confidences) if confidences else None,
+            }
+        finally:
+            if audio.exists():
+                audio.unlink()
+
+
+class WhisperCppBackend:
+    """Local whisper.cpp adapter using its JSON output and word timestamps."""
+
+    def __init__(self, model_path='', executable='whisper-cli'):
+        self.model_path = str(Path(model_path).expanduser()) if model_path else ''
+        self.executable = executable
+
+    def transcribe(self, video_path, log_cb=None):
+        executable = shutil.which(self.executable) or (self.executable if os.path.isfile(self.executable) else None)
+        if not executable:
+            raise RuntimeError('whisper.cpp executable was not found')
+        if not self.model_path or not os.path.isfile(self.model_path):
+            raise RuntimeError('whisper.cpp backend requires a configured GGML model path')
+        audio = _extract_audio(video_path)
+        prefix = audio.with_suffix('')
+        json_path = prefix.with_suffix('.json')
+        try:
+            if log_cb:
+                log_cb('🎙️  Running whisper.cpp with word timestamps...')
+            completed = subprocess.run(
+                [executable, '-m', self.model_path, '-f', str(audio), '-oj', '-of', str(prefix), '-nt'],
+                capture_output=True, text=True, timeout=900)
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or 'whisper.cpp failed').strip().splitlines()[-1]
+                raise RuntimeError(detail)
+            if json_path.is_file():
+                return self._parse_json(json.loads(json_path.read_text(encoding='utf-8')))
+            return {'text': completed.stdout.strip()}
+        finally:
+            if audio.exists():
+                audio.unlink()
+            if json_path.exists():
+                json_path.unlink()
+
+    @staticmethod
+    def _parse_json(payload):
+        segments = payload.get('transcription', payload.get('segments', [])) if isinstance(payload, dict) else []
+        words = []
+        texts = []
+        start = end = 0.0
+        for segment in segments:
+            timestamps = segment.get('timestamps', {})
+            start = _parse_timecode(timestamps.get('from', segment.get('start', 0.0))) if not texts else start
+            end = _parse_timecode(timestamps.get('to', segment.get('end', start)))
+            text = str(segment.get('text', '')).strip()
+            texts.append(text)
+            for token in segment.get('tokens', []):
+                token_text = str(token.get('text', '')).strip()
+                if token_text:
+                    words.append({'text': token_text, 'start': start, 'end': end, 'confidence': token.get('p')})
+        confidences = [word['confidence'] for word in words if word['confidence'] is not None]
+        return {
+            'text': ' '.join(texts).strip(), 'start': start, 'end': end, 'words': words,
+            'confidence': sum(confidences) / len(confidences) if confidences else None,
+        }
+
+
+class AudioVisualFusionBackend:
+    """Arbitrate visual and audio word hypotheses by confidence."""
+
+    def __init__(self, visual_backend, audio_backend, audio_threshold=0.55):
+        self.visual_backend = visual_backend
+        self.audio_backend = audio_backend
+        self.audio_threshold = audio_threshold
+
+    def transcribe(self, video_path, log_cb=None):
+        visual = _transcription_payload(self.visual_backend.transcribe(video_path, log_cb=log_cb))
+        try:
+            audio = _transcription_payload(self.audio_backend.transcribe(video_path, log_cb=log_cb))
+        except Exception as exc:
+            if log_cb:
+                log_cb(f'⚠️  Audio path unavailable; using visual result: {exc}')
+            return visual
+        visual_words = visual.get('words') or []
+        audio_words = audio.get('words') or []
+        if not visual_words or not audio_words:
+            return audio if (audio.get('confidence') or 0) >= (visual.get('confidence') or 0) else visual
+
+        merged = []
+        for index in range(max(len(visual_words), len(audio_words))):
+            candidates = [word for word in (visual_words[index] if index < len(visual_words) else None, audio_words[index] if index < len(audio_words) else None) if word]
+            best = max(candidates, key=lambda word: word.get('confidence') if word.get('confidence') is not None else 0.0)
+            if best is audio_words[index] and (best.get('confidence') or 0.0) < self.audio_threshold and index < len(visual_words):
+                best = visual_words[index]
+            merged.append(best)
+        confidence_values = [word.get('confidence') for word in merged if word.get('confidence') is not None]
+        return {
+            'text': ' '.join(word['text'] for word in merged).strip(),
+            'start': min(visual.get('start', 0.0), audio.get('start', 0.0)),
+            'end': max(visual.get('end', 0.0), audio.get('end', 0.0)),
+            'words': merged,
+            'confidence': sum(confidence_values) / len(confidence_values) if confidence_values else None,
+        }
+
+    def transcribe_batch(self, video_paths, log_cb=None):
+        return [self.transcribe(path, log_cb=log_cb) for path in video_paths]
+
+
 # ── Export ──────────────────────────────────────────────────────────────────
 def _ts(s):
     milliseconds = int(round(_timestamp_value(s, 'timestamp') * 1000))
@@ -1281,6 +1681,28 @@ def create_backend(name, config=None):
         return HuggingFaceSpaceBackend(config.get('hf_space_url', ''))
     if normalized in ('local', 'auto-avsr', 'autoavsr'):
         return LocalAutoAVSRBackend()
+    if normalized in ('onnx', 'local-onnx', 'onnxruntime'):
+        return LocalONNXBackend(
+            config.get('onnx_model_path', ''),
+            config.get('onnx_tokenizer_path', ''),
+            config.get('onnx_provider', 'CPUExecutionProvider'),
+        )
+    if normalized in ('vallr', 'vallr-backend'):
+        return VALLRBackend(config.get('vallr_command', ''), config.get('vallr_model_path', ''))
+    if normalized in ('avhubert', 'av-hubert', 'av_hubert'):
+        return AVHuBERTBackend(config.get('avhubert_command', ''), config.get('avhubert_model_path', ''))
+    if normalized in ('whisper', 'faster-whisper', 'fasterwhisper', 'audio'):
+        return FasterWhisperBackend(
+            config.get('whisper_model', 'small'),
+            config.get('whisper_device', 'auto'),
+            config.get('whisper_compute_type', 'int8'),
+        )
+    if normalized in ('whisper.cpp', 'whisper-cpp', 'whispercpp'):
+        return WhisperCppBackend(config.get('whisper_cpp_model_path', ''), config.get('whisper_cpp_executable', 'whisper-cli'))
+    if normalized in ('fusion', 'audio-visual', 'av-fusion'):
+        visual = create_backend(config.get('fusion_visual_backend', 'onnx'), config)
+        audio = create_backend(config.get('fusion_audio_backend', 'faster-whisper'), config)
+        return AudioVisualFusionBackend(visual, audio, float(config.get('fusion_audio_threshold', 0.55)))
     if normalized in ('replicate', 'cloud'):
         token = config.get('replicate_api_token', '')
         if not token:
@@ -1635,6 +2057,10 @@ class LipSightWindow(QMainWindow):
         self.tbl.setAlternatingRowColors(True); self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); self.tbl.verticalHeader().setVisible(False)
         rl.addWidget(self.tbl)
+        self.confidence_view = QTextBrowser(); self.confidence_view.setOpenLinks(False); self.confidence_view.setMaximumHeight(58)
+        self.confidence_view.setPlaceholderText("Word confidence overlay appears after inference")
+        self.confidence_view.setStyleSheet(f"background-color:{C['mantle']};border:1px solid {C['surface0']};padding:4px;")
+        rl.addWidget(self.confidence_view)
         self.txte = QTextEdit(); self.txte.setReadOnly(False); self.txte.setMaximumHeight(120)
         self.txte.setPlaceholderText("Full transcript — edit here, then Apply Review..."); rl.addWidget(self.txte)
         er = QHBoxLayout()
@@ -1732,7 +2158,7 @@ class LipSightWindow(QMainWindow):
         if not p: return
         try:
             self.video_path = p; self.results = []; self.segments = []; self.review_edits = []; self._curve_data = []
-            self.tbl.setRowCount(0); self.txte.clear(); self.curve.set_data(); self.roi_preview.clear(); self._exp(False)
+            self.tbl.setRowCount(0); self.txte.clear(); self.confidence_view.clear(); self.curve.set_data(); self.roi_preview.clear(); self._exp(False)
             cap = cv2.VideoCapture(p)
             if not cap.isOpened(): self._log("❌ Can't open"); return
             fps = cap.get(cv2.CAP_PROP_FPS) or 25.0; frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1829,6 +2255,7 @@ class LipSightWindow(QMainWindow):
     def _od(self, res):
         self.results = res; self.b_process.setEnabled(True); self.b_analyze.setEnabled(True); self.b_cancel.setEnabled(False); self._exp(True)
         full = '\n'.join(r['text'] for r in res if r['text']); self.txte.setPlainText(full)
+        self.confidence_view.setHtml(confidence_overlay_html(res))
         self.statusBar().showMessage(f"Done — {len(res)} seg(s), {len(full.split())} words")
         Toast(self, f"  ✅  {len(res)} segments transcribed  ", C['green'])
 
@@ -1882,6 +2309,7 @@ class LipSightWindow(QMainWindow):
         for result in self.results:
             self._or(result)
         self.txte.setPlainText('\n'.join(result['text'] for result in self.results if result['text']))
+        self.confidence_view.setHtml(confidence_overlay_html(self.results))
         self._log(f"✎ Applied {len(edits)} review edit(s)")
         Toast(self, f"  ✅  Review applied  ", C['green'])
 
@@ -1928,11 +2356,19 @@ def build_cli_parser():
     parser.add_argument('--input', help='input video path')
     parser.add_argument('--output', help='output SRT/VTT/TXT/JSON path')
     parser.add_argument('--output-format', choices=('srt', 'vtt', 'txt', 'json'), help='override output format')
-    parser.add_argument('--backend', default='hf', help='hf, local, replicate, or custom')
+    parser.add_argument('--backend', default='hf', help='hf, local, onnx, vallr, avhubert, whisper, whisper.cpp, fusion, replicate, or custom')
     parser.add_argument('--hf-url', default='', help='custom HuggingFace Space URL')
     parser.add_argument('--replicate-token', default='', help='Replicate API token')
     parser.add_argument('--endpoint-url', default='', help='custom inference endpoint')
     parser.add_argument('--endpoint-key', default='', help='custom endpoint bearer key')
+    parser.add_argument('--onnx-model', default='', help='local ONNX visual model path')
+    parser.add_argument('--onnx-tokenizer', default='', help='optional ONNX token map JSON path')
+    parser.add_argument('--onnx-provider', default='CPUExecutionProvider', help='ONNX execution provider')
+    parser.add_argument('--runner-command', default='', help='VALLR/AV-HuBERT local runner command')
+    parser.add_argument('--runner-model', default='', help='VALLR/AV-HuBERT model path')
+    parser.add_argument('--whisper-model', default='small', help='faster-whisper model name')
+    parser.add_argument('--whisper-cpp-model', default='', help='whisper.cpp GGML model path')
+    parser.add_argument('--whisper-cpp-executable', default='whisper-cli', help='whisper.cpp executable')
     parser.add_argument('--no-segmentation', action='store_true', help='process the full video as one segment')
     parser.add_argument('--threshold', type=float, default=0.06, help='mouth movement threshold for segmentation')
     parser.add_argument('--project', help='also save a .lipsight project')
@@ -1951,6 +2387,16 @@ def _cli_config(args):
         'replicate_api_token': args.replicate_token,
         'custom_endpoint': args.endpoint_url,
         'custom_endpoint_key': args.endpoint_key,
+        'onnx_model_path': args.onnx_model,
+        'onnx_tokenizer_path': args.onnx_tokenizer,
+        'onnx_provider': args.onnx_provider,
+        'vallr_command': args.runner_command if args.backend.lower() == 'vallr' else '',
+        'vallr_model_path': args.runner_model if args.backend.lower() == 'vallr' else '',
+        'avhubert_command': args.runner_command if args.backend.lower() in ('avhubert', 'av-hubert') else '',
+        'avhubert_model_path': args.runner_model if args.backend.lower() in ('avhubert', 'av-hubert') else '',
+        'whisper_model': args.whisper_model,
+        'whisper_cpp_model_path': args.whisper_cpp_model,
+        'whisper_cpp_executable': args.whisper_cpp_executable,
     }
 
 
